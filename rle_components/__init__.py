@@ -11,12 +11,20 @@ from .core import (
     Run,
     label,
 )
+from .volume import (
+    ComponentEvent,
+    UpdateResult,
+    VoxelVolume,
+)
 
 __all__ = [
     "BoundingBox",
     "Component",
+    "ComponentEvent",
     "InvalidVolumeError",
     "LabelResult",
     "Run",
+    "UpdateResult",
+    "VoxelVolume",
     "label",
 ]
