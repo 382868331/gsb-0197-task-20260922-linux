@@ -6,17 +6,25 @@
 from .core import (
     BoundingBox,
     Component,
+    ClosedComponent,
+    FinishResult,
     InvalidVolumeError,
     LabelResult,
     Run,
+    SliceResult,
+    StreamLabeler,
     label,
 )
 
 __all__ = [
     "BoundingBox",
     "Component",
+    "ClosedComponent",
+    "FinishResult",
     "InvalidVolumeError",
     "LabelResult",
     "Run",
+    "SliceResult",
+    "StreamLabeler",
     "label",
 ]

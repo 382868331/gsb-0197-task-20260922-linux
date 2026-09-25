@@ -40,6 +40,10 @@ __all__ = [
     "BoundingBox",
     "Component",
     "LabelResult",
+    "ClosedComponent",
+    "SliceResult",
+    "FinishResult",
+    "StreamLabeler",
     "InvalidVolumeError",
     "label",
 ]
@@ -114,11 +118,415 @@ class LabelResult:
         return self.components[cid - 1]
 
 
+@dataclass(frozen=True)
+class ClosedComponent:
+    """流式处理中已封闭、不可能再连接未来切片的组件。
+
+    ``temporary_id`` 仅为流式阶段的稳定临时身份，不是最终组件 ID；
+    最终 ID 在 :meth:`StreamLabeler.finish` 中按最小体素坐标统一分配。
+    """
+
+    temporary_id: int
+    voxel_count: int
+    bbox: BoundingBox
+    exposed_area: int
+    min_z: int
+    min_y: int
+    min_x: int
+
+
+@dataclass(frozen=True)
+class SliceResult:
+    """一次 :meth:`StreamLabeler.feed_slice` 的结果。"""
+
+    z: int
+    run_labels: list[list[int]]
+    closed: list[ClosedComponent]
+
+
+@dataclass(frozen=True)
+class FinishResult:
+    """:meth:`StreamLabeler.finish` 的结算结果。"""
+
+    components: list[Component]
+    id_map: dict[int, int]
+    closed: list[ClosedComponent]
+
+
 class InvalidVolumeError(ValueError):
     """输入体数据或参数不满足契约。
 
     消息中带 ``z=.. y=.. run=..`` 等定位前缀；非法输入绝不被静默纠正。
     """
+
+
+# ---------------------------------------------------------------------------
+# 流式主流程
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _CompState:
+    """仅为仍可能接触未来切片的未封闭组件保留的边界聚合状态。"""
+
+    tid: int
+    voxels: int
+    internal_faces: int
+    min_z: int
+    min_y: int
+    min_x: int
+    max_z: int
+    max_y: int
+    max_x: int
+    key_z: int
+    key_y: int
+    key_x: int
+    parent: int = 0
+    on_boundary: bool = False
+
+    def __post_init__(self) -> None:
+        self.parent = self.tid
+
+    def closed(self) -> ClosedComponent:
+        bbox = BoundingBox(
+            self.min_z,
+            self.min_y,
+            self.min_x,
+            self.max_z,
+            self.max_y,
+            self.max_x,
+        )
+        return ClosedComponent(
+            temporary_id=self.tid,
+            voxel_count=self.voxels,
+            bbox=bbox,
+            exposed_area=6 * self.voxels - 2 * self.internal_faces,
+            min_z=self.key_z,
+            min_y=self.key_y,
+            min_x=self.key_x,
+        )
+
+
+class StreamLabeler:
+    """逐 z 切片喂入的游程连通组件标记器。
+
+    切片必须通过 :meth:`feed_slice` 按连续、递增的 z 顺序显式喂入，
+    整层没有体素时也要传入一个全为 ``[]`` 的空切片。每次喂入后，
+    不再接触最新切片的组件会随返回值封闭；其活跃合并状态随即释放。
+    临时 ID 在整个流中稳定且不重用，最终 ID 只在 :meth:`finish` 时
+    按组件最小体素坐标统一分配。
+    """
+
+    def __init__(
+        self,
+        depth: int,
+        height: int,
+        width: int,
+        connectivity: int = 6,
+    ) -> None:
+        self.depth = _check_dim(depth, "depth")
+        self.height = _check_dim(height, "height")
+        self.width = _check_dim(width, "width")
+        if (
+            isinstance(connectivity, bool)
+            or not isinstance(connectivity, int)
+            or connectivity not in _VALID_CONNECTIVITY
+        ):
+            raise InvalidVolumeError(
+                "connectivity 必须为整数 6/18/26 之一（拒绝 bool/float），"
+                f"得到 {type(connectivity).__name__}: {connectivity!r}"
+            )
+        self.connectivity = connectivity
+        self._edge = connectivity >= 18
+        self._corner = connectivity == 26
+        self._next_tid = 1
+        self._next_z = 0
+        self._total_runs = 0
+        self._prev_rows: list[list[tuple[int, int]]] | None = None
+        self._prev_tids: list[list[int]] | None = []
+        self._states: dict[int, _CompState] = {}
+        self._closed: list[ClosedComponent] = []
+        self._aliases: dict[int, int] = {}
+        self._finished = False
+
+    @property
+    def active_temporary_ids(self) -> tuple[int, ...]:
+        """当前仍接触最新切片、可与未来切片合并的临时身份。"""
+
+        if self._finished:
+            return ()
+        return tuple(
+            tid for tid, st in self._states.items() if st.on_boundary
+        )
+
+    @property
+    def num_active_components(self) -> int:
+        """边界上的未封闭组件数；整层空白后为 0。"""
+
+        return len(self.active_temporary_ids)
+
+    @property
+    def num_boundary_runs(self) -> int:
+        """最新切片中的游程数；只保留边界游程，不保留历史展开体。"""
+
+        if self._finished or self._prev_tids is None:
+            return 0
+        return sum(len(row) for row in self._prev_tids)
+
+    def feed_slice(self, z: object, rows: object) -> SliceResult:
+        """喂入一个切片，返回该切片游程标签和本切片后封闭的组件。"""
+
+        if self._finished:
+            raise InvalidVolumeError("finish 已调用，不能继续喂入切片")
+        if isinstance(z, bool) or not isinstance(z, int):
+            raise InvalidVolumeError(
+                f"z 必须为整数（拒绝 bool），得到 {type(z).__name__}: {z!r}"
+            )
+        if z != self._next_z:
+            expected = self._next_z
+            raise InvalidVolumeError(
+                f"切片 z 必须连续递增：期望 z={expected}，得到 z={z}；"
+                "空切片也必须显式喂入"
+            )
+
+        normalized, slice_runs = _normalize_slice(
+            rows, z, self.height, self.width
+        )
+        if self._total_runs + slice_runs > MAX_RUNS:
+            raise InvalidVolumeError(
+                f"游程总数超过上限 {MAX_RUNS}（z={z}）"
+            )
+
+        for state in self._states.values():
+            state.on_boundary = False
+
+        cur_tids: list[list[int]] = [[] for _ in range(self.height)]
+        run_labels: list[list[int]] = [[] for _ in range(self.height)]
+
+        for y, row in enumerate(normalized):
+            ids = cur_tids[y]
+            labels = run_labels[y]
+            for s, e in row:
+                tid = self._next_tid
+                self._next_tid += 1
+                self._states[tid] = _CompState(
+                    tid=tid,
+                    voxels=e - s,
+                    internal_faces=max(0, e - s - 1),
+                    min_z=z,
+                    min_y=y,
+                    min_x=s,
+                    max_z=z + 1,
+                    max_y=y + 1,
+                    max_x=e,
+                    key_z=z,
+                    key_y=y,
+                    key_x=s,
+                    on_boundary=True,
+                )
+                ids.append(tid)
+                labels.append(tid)
+
+            for ri in range(1, len(ids)):
+                if normalized[y][ri - 1][1] == row[ri][0]:
+                    self._merge(ids[ri - 1], ids[ri], 1)
+
+            if y > 0:
+                for i, j, overlap in _pairs(row, normalized[y - 1]):
+                    if overlap > 0:
+                        self._merge(ids[i], cur_tids[y - 1][j], overlap)
+                    elif self._edge:
+                        self._merge(ids[i], cur_tids[y - 1][j], 0)
+
+            if self._prev_rows is not None and self._prev_tids:
+                for dy in (-1, 0, 1):
+                    py = y + dy
+                    if not 0 <= py < self.height:
+                        continue
+                    for i, j, overlap in _pairs(
+                        row, self._prev_rows[py]
+                    ):
+                        face_count = overlap if dy == 0 and overlap > 0 else 0
+                        connected = (
+                            (dy == 0 and (overlap > 0 or self._edge))
+                            or (dy != 0 and overlap > 0 and self._edge)
+                            or (dy != 0 and overlap == 0 and self._corner)
+                        )
+                        if connected:
+                            self._merge(
+                                ids[i],
+                                self._prev_tids[py][j],
+                                face_count,
+                            )
+
+        for y in range(self.height):
+            resolved: list[int] = []
+            for tid in cur_tids[y]:
+                root = self._find(tid)
+                resolved.append(root)
+            cur_tids[y] = resolved
+            if run_labels[y]:
+                run_labels[y] = resolved
+
+        closed: list[ClosedComponent] = []
+        stale = [tid for tid, st in self._states.items() if not st.on_boundary]
+        for tid in stale:
+            root = self._find(tid)
+            if root == tid:
+                closed.append(self._states.pop(tid).closed())
+            else:
+                self._states.pop(tid, None)
+                self._aliases[tid] = root
+        closed.sort(key=lambda c: (c.min_z, c.min_y, c.min_x))
+        self._closed.extend(closed)
+
+        self._prev_rows = normalized if slice_runs else None
+        self._prev_tids = cur_tids if slice_runs else None
+        self._next_z += 1
+        self._total_runs += slice_runs
+
+        return SliceResult(z=z, run_labels=run_labels, closed=closed)
+
+    def finish(self) -> FinishResult:
+        """结算剩余未封闭组件，并返回最终 ID 映射。"""
+
+        if self._finished:
+            raise InvalidVolumeError("finish 只能调用一次")
+
+        remaining_roots = {
+            self._find(tid)
+            for tid, state in self._states.items()
+            if state.on_boundary
+        }
+        remaining = [self._states[tid].closed() for tid in remaining_roots]
+        all_closed = self._closed + remaining
+        all_closed.sort(key=lambda c: (c.min_z, c.min_y, c.min_x))
+
+        components: list[Component] = []
+        id_map: dict[int, int] = {}
+        for final_id, closed in enumerate(all_closed, start=1):
+            id_map[closed.temporary_id] = final_id
+            components.append(
+                Component(
+                    id=final_id,
+                    voxel_count=closed.voxel_count,
+                    bbox=closed.bbox,
+                    exposed_area=closed.exposed_area,
+                    min_z=closed.min_z,
+                    min_y=closed.min_y,
+                    min_x=closed.min_x,
+                )
+            )
+
+        for alias, target in self._aliases.items():
+            while target not in id_map:
+                target = self._aliases[target]
+            id_map[alias] = id_map[target]
+
+        self._states.clear()
+        self._prev_rows = None
+        self._prev_tids = []
+        self._finished = True
+
+        return FinishResult(
+            components=components,
+            id_map=id_map,
+            closed=all_closed,
+        )
+
+    def _find(self, tid: int) -> int:
+        if tid not in self._states:
+            target = self._aliases[tid]
+            root = self._find(target)
+            self._aliases[tid] = root
+            return root
+        path = []
+        root = tid
+        while root in self._states:
+            parent = self._states[root].parent
+            if parent == root:
+                break
+            path.append(root)
+            root = parent
+        if root not in self._states:
+            root = self._find(root)
+        for node in path:
+            self._states[node].parent = root
+        return root
+
+    def _merge(self, a: int, b: int, face_count: int) -> None:
+        ra = self._find(a)
+        rb = self._find(b)
+        if ra == rb:
+            sa = self._states[ra]
+            sa.internal_faces += face_count
+            return
+
+        sa = self._states[ra]
+        sb = self._states[rb]
+        if (sa.key_z, sa.key_y, sa.key_x) > (
+            sb.key_z,
+            sb.key_y,
+            sb.key_x,
+        ):
+            ra, rb = rb, ra
+            sa, sb = sb, sa
+
+        sa.voxels += sb.voxels
+        sa.internal_faces += sb.internal_faces + face_count
+        sa.min_z = min(sa.min_z, sb.min_z)
+        sa.min_y = min(sa.min_y, sb.min_y)
+        sa.min_x = min(sa.min_x, sb.min_x)
+        sa.max_z = max(sa.max_z, sb.max_z)
+        sa.max_y = max(sa.max_y, sb.max_y)
+        sa.max_x = max(sa.max_x, sb.max_x)
+        sa.on_boundary = True
+        sb.parent = ra
+        sb.on_boundary = False
+        self._aliases[rb] = ra
+
+
+def label(
+    runs: object,
+    depth: int,
+    height: int,
+    width: int,
+    connectivity: int = 6,
+) -> LabelResult:
+    """对 RLE 二值体做连通组件标记（旧的一次性批处理入口）。"""
+
+    depth = _check_dim(depth, "depth")
+    height = _check_dim(height, "height")
+    width = _check_dim(width, "width")
+    if (
+        isinstance(connectivity, bool)
+        or not isinstance(connectivity, int)
+        or connectivity not in _VALID_CONNECTIVITY
+    ):
+        raise InvalidVolumeError(
+            f"connectivity 必须为整数 6/18/26 之一（拒绝 bool/float），"
+            f"得到 {type(connectivity).__name__}: {connectivity!r}"
+        )
+
+    vol = _normalize_runs(runs, depth, height, width)
+    stream = StreamLabeler(depth, height, width, connectivity)
+    run_labels: list[list[list[int]]] = []
+    temporary_labels: list[list[list[int]]] = []
+    for z, slice_rows in enumerate(vol):
+        result = stream.feed_slice(z, slice_rows)
+        temporary_labels.append(result.run_labels)
+    finished = stream.finish()
+    for sl in temporary_labels:
+        run_labels.append(
+            [[finished.id_map[tid] for tid in row] for row in sl]
+        )
+
+    return LabelResult(
+        run_labels=run_labels,
+        components=finished.components,
+        connectivity=connectivity,
+        num_runs=sum(len(row) for sl in vol for row in sl),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -168,98 +576,90 @@ def _normalize_runs(
     total = 0
 
     for z, slice_rows in enumerate(runs):
-        if not isinstance(slice_rows, Sequence) or isinstance(
-            slice_rows, (str, bytes)
-        ):
+        out_slice, slice_total = _normalize_slice(
+            slice_rows, z, height, width
+        )
+        if total + slice_total > MAX_RUNS:
             raise InvalidVolumeError(
-                f"z={z}: 切片必须为按行组织的序列，"
-                f"得到 {type(slice_rows).__name__}"
+                f"游程总数超过上限 {MAX_RUNS}（z={z}）"
             )
-        if len(slice_rows) != height:
-            raise InvalidVolumeError(
-                f"z={z}: 行数 {len(slice_rows)} 与 height={height} 不一致"
-            )
-
-        out_slice: list[list[tuple[int, int]]] = []
-        for y, row in enumerate(slice_rows):
-            if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
-                raise InvalidVolumeError(
-                    f"z={z} y={y}: 行必须为游程序列，得到 {type(row).__name__}"
-                )
-
-            out_row: list[tuple[int, int]] = []
-            prev_end = 0
-            for ri, run in enumerate(row):
-                where = f"z={z} y={y} run={ri}"
-                if isinstance(run, dict):
-                    if set(run) != {"start", "end"}:
-                        raise InvalidVolumeError(
-                            f"{where}: 字典游程只能含键 start/end，得到 {sorted(run)}"
-                        )
-                    raw0, raw1 = run["start"], run["end"]
-                elif isinstance(run, Sequence) and not isinstance(
-                    run, (str, bytes)
-                ) and len(run) == 2:
-                    raw0, raw1 = run[0], run[1]
-                else:
-                    raise InvalidVolumeError(
-                        f"{where}: 游程必须为 (start, end) 二元组，得到 {run!r}"
-                    )
-
-                x0 = _check_coord(raw0, where + ".start")
-                x1 = _check_coord(raw1, where + ".end")
-                if not 0 <= x0 < x1 <= width:
-                    raise InvalidVolumeError(
-                        f"{where}: 要求 0 <= start < end <= width({width})，"
-                        f"得到 start={x0}, end={x1}（空游程/越界均非法）"
-                    )
-                if ri > 0 and x0 < prev_end:
-                    raise InvalidVolumeError(
-                        f"{where}: 游程必须按 start 升序且互不重叠，"
-                        f"start={x0} 早于上游 end={prev_end}"
-                    )
-                out_row.append((x0, x1))
-                prev_end = x1
-                total += 1
-                if total > MAX_RUNS:
-                    raise InvalidVolumeError(
-                        f"游程总数超过上限 {MAX_RUNS}（z={z} y={y} run={ri}）"
-                    )
-            out_slice.append(out_row)
         normalized.append(out_slice)
+        total += slice_total
 
     return normalized
+
+
+def _normalize_slice(
+    slice_rows: object, z: int, height: int, width: int
+) -> tuple[list[list[tuple[int, int]]], int]:
+    """校验并规范化一个切片；成功前不产生对外状态。"""
+
+    total = 0
+    out_slice: list[list[tuple[int, int]]] = []
+    if not isinstance(slice_rows, Sequence) or isinstance(
+        slice_rows, (str, bytes)
+    ):
+        raise InvalidVolumeError(
+            f"z={z}: 切片必须为按行组织的序列，"
+            f"得到 {type(slice_rows).__name__}"
+        )
+    if len(slice_rows) != height:
+        raise InvalidVolumeError(
+            f"z={z}: 行数 {len(slice_rows)} 与 height={height} 不一致"
+        )
+
+    for y, row in enumerate(slice_rows):
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
+            raise InvalidVolumeError(
+                f"z={z} y={y}: 行必须为游程序列，得到 {type(row).__name__}"
+            )
+
+        out_row: list[tuple[int, int]] = []
+        prev_end = 0
+        for ri, run in enumerate(row):
+            where = f"z={z} y={y} run={ri}"
+            if isinstance(run, dict):
+                if set(run) != {"start", "end"}:
+                    raise InvalidVolumeError(
+                        f"{where}: 字典游程只能含键 start/end，得到 {sorted(run)}"
+                    )
+                raw0, raw1 = run["start"], run["end"]
+            elif isinstance(run, Sequence) and not isinstance(
+                run, (str, bytes)
+            ) and len(run) == 2:
+                raw0, raw1 = run[0], run[1]
+            else:
+                raise InvalidVolumeError(
+                    f"{where}: 游程必须为 (start, end) 二元组，得到 {run!r}"
+                )
+
+            x0 = _check_coord(raw0, where + ".start")
+            x1 = _check_coord(raw1, where + ".end")
+            if not 0 <= x0 < x1 <= width:
+                raise InvalidVolumeError(
+                    f"{where}: 要求 0 <= start < end <= width({width})，"
+                    f"得到 start={x0}, end={x1}（空游程/越界均非法）"
+                )
+            if ri > 0 and x0 < prev_end:
+                raise InvalidVolumeError(
+                    f"{where}: 游程必须按 start 升序且互不重叠，"
+                    f"start={x0} 早于上游 end={prev_end}"
+                )
+            out_row.append((x0, x1))
+            prev_end = x1
+            total += 1
+            if total > MAX_RUNS:
+                raise InvalidVolumeError(
+                    f"切片 z={z} 内游程数超过全局上限 {MAX_RUNS}"
+                    f"（y={y} run={ri}）"
+                )
+        out_slice.append(out_row)
+    return out_slice, total
 
 
 # ---------------------------------------------------------------------------
 # 并查集
 # ---------------------------------------------------------------------------
-
-
-class _DSU:
-    __slots__ = ("parent", "size")
-
-    def __init__(self, n: int) -> None:
-        self.parent = list(range(n))
-        self.size = [0] * n  # 节点对应游程的体素数，合并后为组件体素数
-
-    def find(self, x: int) -> int:
-        parent = self.parent
-        root = x
-        while parent[root] != root:
-            root = parent[root]
-        while parent[x] != x:
-            parent[x], x = root, parent[x]
-        return root
-
-    def union(self, a: int, b: int) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra == rb:
-            return
-        if self.size[ra] < self.size[rb]:
-            ra, rb = rb, ra
-        self.parent[rb] = ra
-        self.size[ra] += self.size[rb]
 
 
 def _pairs(a_runs, b_runs):
@@ -292,221 +692,3 @@ def _pairs(a_runs, b_runs):
 
 
 # ---------------------------------------------------------------------------
-# 主流程
-# ---------------------------------------------------------------------------
-
-
-def label(
-    runs: object,
-    depth: int,
-    height: int,
-    width: int,
-    connectivity: int = 6,
-) -> LabelResult:
-    """对 RLE 二值体做连通组件标记。
-
-    Args:
-        runs: ``[z][y] -> [(start, end), ...]``；游程可为 :class:`Run`、
-            二元组/列表，或 ``{"start": int, "end": int}`` 字典。
-        depth: z 方向尺寸（切片数），1..512。
-        height: y 方向尺寸（每切片行数），1..512。
-        width: x 方向尺寸，1..512；空体请用空行表示。
-        connectivity: 6（仅面）/ 18（面+边）/ 26（面+边+角）。
-
-    Returns:
-        :class:`LabelResult`，含每游程组件 ID 与每组件统计。
-
-    Raises:
-        InvalidVolumeError: 参数或数据不满足契约（bool 冒称整数、
-            NaN/Infinity、越界、空游程、重叠/乱序、结构尺寸不符、
-            游程数超过 20000 等），消息带 z/y/run 定位。
-    """
-
-    depth = _check_dim(depth, "depth")
-    height = _check_dim(height, "height")
-    width = _check_dim(width, "width")
-    if (
-        isinstance(connectivity, bool)
-        or not isinstance(connectivity, int)
-        or connectivity not in _VALID_CONNECTIVITY
-    ):
-        raise InvalidVolumeError(
-            f"connectivity 必须为整数 6/18/26 之一（拒绝 bool/float），"
-            f"得到 {type(connectivity).__name__}: {connectivity!r}"
-        )
-
-    vol = _normalize_runs(runs, depth, height, width)
-    edge_mode = connectivity >= 18   # 18 或 26 合并边接触
-    corner_mode = connectivity == 26  # 仅 26 合并角接触
-
-    total_runs = sum(len(row) for sl in vol for row in sl)
-    dsu = _DSU(total_runs)
-    # 面邻居体素对数，最终在并查集根上汇总；每对仅在一个方向计一次
-    face_pairs: list[tuple[int, int, int]] = []
-
-    # 节点编号即游程创建顺序（z, y, 行内序 = 字典序）
-    node_z: list[int] = []
-    node_y: list[int] = []
-    node_x0: list[int] = []
-    node_x1: list[int] = []
-    # 输出用 [z][y] -> [node_id,...]
-    nodes_by: list[list[list[int]]] = []
-
-    # 只保留两个切片的节点表
-    prev_nodes: list[list[int]] | None = None
-    next_id = 0
-
-    for z in range(depth):
-        cur_nodes: list[list[int]] = []
-        nodes_by.append(cur_nodes)
-        for y in range(height):
-            row = vol[z][y]
-            ids: list[int] = []
-            for s, e in row:
-                nid = next_id
-                next_id += 1
-                dsu.size[nid] = e - s
-                # 游程内部 x 方向体素面邻居（length-1 个），面积统计用
-                face_pairs.append((nid, nid, e - s - 1))
-                node_z.append(z)
-                node_y.append(y)
-                node_x0.append(s)
-                node_x1.append(e)
-                ids.append(nid)
-            cur_nodes.append(ids)
-
-            # --- x 方向：同行游程，仅端点相接（面）才合并 ---
-            for ri in range(1, len(ids)):
-                if row[ri - 1][1] == row[ri][0]:
-                    dsu.union(ids[ri - 1], ids[ri])
-                    face_pairs.append((ids[ri - 1], ids[ri], 1))
-
-            # --- y 方向：同切片 y-1 行（其节点已创建；行对 (y-1,y) ---
-            # 在处理 y 时恰好检查一次）
-            if y - 1 >= 0:
-                other = vol[z][y - 1]
-                other_ids = cur_nodes[y - 1]
-                for i, j, ov in _pairs(row, other):
-                    if ov > 0:
-                        # x 重叠 → 面接触：所有连通性都合并，逐体素计面
-                        dsu.union(ids[i], other_ids[j])
-                        face_pairs.append((ids[i], other_ids[j], ov))
-                    elif edge_mode:
-                        # 端点相接（dy=1, dx=1）→ 边接触
-                        dsu.union(ids[i], other_ids[j])
-
-            # --- z 方向：前一切片的 y-1 / y / y+1 三行 ---
-            # 注意与同切片 y 方向不同：(cur y, prev y+1) 这一游程对
-            # 无法靠处理其他行覆盖（两行分属不同切片的不同行），三行
-            # 都必须在本行扫描；每个 (cur_y, prev_y) 组合只在此出现一次。
-            if prev_nodes is not None:
-                for dy in (-1, 0, 1):
-                    py = y + dy
-                    if not 0 <= py < height:
-                        continue
-                    prow = vol[z - 1][py]
-                    pids = prev_nodes[py]
-                    for i, j, ov in _pairs(row, prow):
-                        if dy == 0:
-                            if ov > 0:
-                                # dz=1, dy=0, x 重叠 → 面接触
-                                dsu.union(ids[i], pids[j])
-                                face_pairs.append((ids[i], pids[j], ov))
-                            elif edge_mode:
-                                # dz=1, dy=0, dx=1 → 边接触
-                                dsu.union(ids[i], pids[j])
-                        else:
-                            if ov > 0:
-                                # dz=1, |dy|=1, x 重叠 → 边接触
-                                if edge_mode:
-                                    dsu.union(ids[i], pids[j])
-                            else:
-                                # dz=1, |dy|=1, dx=1 → 角接触
-                                if corner_mode:
-                                    dsu.union(ids[i], pids[j])
-
-        prev_nodes = cur_nodes
-
-    # ------------------------------------------------------------------
-    # 聚合：节点按创建顺序遍历，根第一次出现时的 (z,y,x0) 即组件最小坐标
-    # ------------------------------------------------------------------
-
-    n = total_runs
-    # 排序键：组件字典序最小体素（节点创建序 = (z,y,x) 序，根首次出现处）
-    key_z = [0] * n
-    key_y = [0] * n
-    key_x = [0] * n
-    # 几何包围盒（与排序键可能不同，26 邻接下尤甚）
-    min_z = [0] * n
-    min_y = [0] * n
-    min_x = [0] * n
-    max_z = [0] * n
-    max_y = [0] * n
-    max_x = [0] * n
-    seen: set[int] = set()
-
-    for nid in range(n):
-        r = dsu.find(nid)
-        z, y, x0, x1 = node_z[nid], node_y[nid], node_x0[nid], node_x1[nid]
-        if r not in seen:
-            seen.add(r)
-            key_z[r] = z
-            key_y[r] = y
-            key_x[r] = x0
-            min_z[r] = z
-            min_y[r] = y
-            min_x[r] = x0
-            max_z[r] = z + 1
-            max_y[r] = y + 1
-            max_x[r] = x1
-        else:
-            if z < min_z[r]:
-                min_z[r] = z
-            if y < min_y[r]:
-                min_y[r] = y
-            if x0 < min_x[r]:
-                min_x[r] = x0
-            if z + 1 > max_z[r]:
-                max_z[r] = z + 1
-            if y + 1 > max_y[r]:
-                max_y[r] = y + 1
-            if x1 > max_x[r]:
-                max_x[r] = x1
-
-    internal_faces = [0] * n
-    for a, b, count in face_pairs:
-        internal_faces[dsu.find(a)] += count
-
-    roots = sorted(seen, key=lambda r: (key_z[r], key_y[r], key_x[r]))
-    root_to_cid = {r: cid for cid, r in enumerate(roots, start=1)}
-
-    components: list[Component] = []
-    for cid, r in enumerate(roots, start=1):
-        voxels = dsu.size[r]
-        area = 6 * voxels - 2 * internal_faces[r]
-        bbox = BoundingBox(
-            min_z[r], min_y[r], min_x[r], max_z[r], max_y[r], max_x[r]
-        )
-        components.append(
-            Component(
-                id=cid,
-                voxel_count=voxels,
-                bbox=bbox,
-                exposed_area=area,
-                min_z=key_z[r],
-                min_y=key_y[r],
-                min_x=key_x[r],
-            )
-        )
-
-    run_labels = [
-        [[root_to_cid[dsu.find(nid)] for nid in row_ids] for row_ids in sl]
-        for sl in nodes_by
-    ]
-
-    return LabelResult(
-        run_labels=run_labels,
-        components=components,
-        connectivity=connectivity,
-        num_runs=total_runs,
-    )

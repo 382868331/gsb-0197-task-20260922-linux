@@ -10,7 +10,7 @@
 不 sleep、不读取外部数据、不使用预录结果。
 """
 
-from rle_components import InvalidVolumeError, label
+from rle_components import InvalidVolumeError, StreamLabeler, label
 
 DEPTH = HEIGHT = WIDTH = 4
 
@@ -103,6 +103,52 @@ def main():
         print(f"  如预期拒绝：{type(exc).__name__}: {exc}")
     else:  # pragma: no cover
         raise AssertionError("NaN 输入未被拒绝")
+
+    print("\n=== 流式 feed_slice/finish 演示 ===")
+    depth, height, width = 5, 3, 8
+    stream_slices = [
+        # z0：长条开始
+        [[(0, 5)], [], []],
+        # z1：长条继续；夹在远处的短组件在 z2 后封闭
+        [[(0, 5)], [], [(6, 8)]],
+        # z2：长条继续；26 邻接斜角接触由下一场景演示，这里仍为短条
+        [[(0, 5)], [], [(6, 8)]],
+        # z3：长条结束，短组件已封闭
+        [[(0, 5)], [], []],
+        # z4：整层空白，长条在本切片结果中封闭
+        [[], [], []],
+    ]
+    stream = StreamLabeler(depth, height, width, 6)
+    for z, rows in enumerate(stream_slices):
+        result = stream.feed_slice(z, rows)
+        print(
+            f"  z={z}: 活跃组件={stream.num_active_components}, "
+            f"边界游程={stream.num_boundary_runs}, "
+            f"新封闭={len(result.closed)}"
+        )
+        for closed in result.closed:
+            print(
+                f"    临时 ID={closed.temporary_id} 封闭: "
+                f"体素={closed.voxel_count} 面积={closed.exposed_area}"
+            )
+    finished = stream.finish()
+    print(
+        "  finish 最终组件数=" + str(len(finished.components))
+        + "，临时 ID→最终 ID："
+        + ", ".join(
+            f"{tid}->{cid}" for tid, cid in sorted(finished.id_map.items())
+        )
+    )
+    assert [c.voxel_count for c in finished.components] == [20, 4]
+
+    diagonal = StreamLabeler(3, 3, 3, 26)
+    diagonal.feed_slice(0, [[(0, 1)], [], []])
+    after_first = diagonal.feed_slice(1, [[], [(1, 2)], []])
+    diagonal.feed_slice(2, [[], [], [(2, 3)]])
+    diagonal_finish = diagonal.finish()
+    assert after_first.closed == []
+    assert len(diagonal_finish.components) == 1
+    print("  26 邻接斜角跨片：3 个切片在 finish 时结算为 1 个组件")
 
 
 if __name__ == "__main__":

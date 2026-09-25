@@ -13,6 +13,7 @@ from rle_components import (
     BoundingBox,
     InvalidVolumeError,
     Run,
+    StreamLabeler,
     label,
 )
 
@@ -257,6 +258,176 @@ class RandomizedReferenceTests(unittest.TestCase):
             vol = random_volume(rng, 3, 3, 40, rng.choice((0.3, 0.55)))
             for conn in (6, 18, 26):
                 assert_matches_reference(self, vol, 3, 3, 40, conn)
+
+
+class StreamingTests(unittest.TestCase):
+    def _assert_stream_matches_reference(
+        self, vol, depth, height, width, conn
+    ):
+        stream = StreamLabeler(depth, height, width, conn)
+        streamed_labels = []
+        closed_by_tid = {}
+        active_events = []
+        for z in range(depth):
+            result = stream.feed_slice(z, vol[z])
+            streamed_labels.append(result.run_labels)
+            active_events.append(
+                (stream.num_active_components, stream.num_boundary_runs)
+            )
+            for closed in result.closed:
+                self.assertNotIn(closed.temporary_id, closed_by_tid)
+                closed_by_tid[closed.temporary_id] = closed
+        finished = stream.finish()
+        for closed in finished.closed:
+            closed_by_tid.setdefault(closed.temporary_id, closed)
+
+        ref_labels, ref_meta = reference_label(
+            vol, depth, height, width, conn
+        )
+        final_labels = [
+            [[finished.id_map[tid] for tid in row] for row in sl]
+            for sl in streamed_labels
+        ]
+        self.assertEqual(final_labels, ref_labels)
+        self.assertEqual(
+            len(closed_by_tid), len(finished.components)
+        )
+        for comp in finished.components:
+            tid = next(
+                tid
+                for tid in closed_by_tid
+                if finished.id_map[tid] == comp.id
+            )
+            closed = closed_by_tid[tid]
+            self.assertEqual(closed.voxel_count, comp.voxel_count)
+            self.assertEqual(closed.bbox, comp.bbox)
+            self.assertEqual(closed.exposed_area, comp.exposed_area)
+            self.assertEqual(
+                (closed.min_z, closed.min_y, closed.min_x),
+                (comp.min_z, comp.min_y, comp.min_x),
+            )
+        self.assertEqual(
+            active_events[-1][1],
+            sum(len(row) for row in vol[-1]),
+        )
+        self.assertEqual(stream.num_active_components, 0)
+        self.assertEqual(stream.num_boundary_runs, 0)
+        return finished
+
+    def test_random_streaming_matches_bfs(self):
+        rng = random.Random(77103)
+        for _ in range(12):
+            d, h, w = (
+                rng.randint(1, 6),
+                rng.randint(1, 6),
+                rng.randint(1, 18),
+            )
+            vol = random_volume(rng, d, h, w, rng.choice((0.2, 0.45, 0.7)))
+            for conn in (6, 18, 26):
+                self._assert_stream_matches_reference(
+                    vol, d, h, w, conn
+                )
+
+    def test_explicit_empty_slices_are_required(self):
+        stream = StreamLabeler(3, 1, 2, 6)
+        first = stream.feed_slice(0, [[(0, 1)]])
+        self.assertEqual(stream.num_active_components, 1)
+        empty = stream.feed_slice(1, [[]])
+        self.assertEqual(empty.run_labels, [[]])
+        self.assertEqual(len(empty.closed), 1)
+        self.assertEqual(stream.num_active_components, 0)
+        self.assertEqual(stream.num_boundary_runs, 0)
+        with self.assertRaises(InvalidVolumeError) as cm:
+            stream.feed_slice(3, [[(1, 2)]])
+        self.assertIn("z=2", str(cm.exception))
+        third = stream.feed_slice(2, [[(1, 2)]])
+        finished = stream.finish()
+        self.assertEqual(len(finished.components), 2)
+        self.assertEqual(finished.components[0].id, 1)
+        self.assertEqual(finished.components[1].id, 2)
+        self.assertEqual(first.closed, [])
+
+    def test_invalid_feed_leaves_stream_state_unchanged(self):
+        stream = StreamLabeler(2, 1, 2, 6)
+        stream.feed_slice(0, [[(0, 1)]])
+        with self.assertRaises(InvalidVolumeError):
+            stream.feed_slice(2, [[(0, 1)]])
+        with self.assertRaises(InvalidVolumeError):
+            stream.feed_slice(1, [[(2, 3)]])
+        result = stream.feed_slice(1, [[(0, 1)]])
+        self.assertEqual(result.closed, [])
+        self.assertEqual(stream.num_active_components, 1)
+        finished = stream.finish()
+        self.assertEqual(len(finished.components), 1)
+        self.assertEqual(finished.components[0].voxel_count, 2)
+
+    def test_long_spans_short_then_blank_slice_and_final_ids(self):
+        # 长条从 z0 延伸到 z2，短条夹在 z1 但不接触；z3 整层空白。
+        vol = [
+            [[(0, 4)], [], []],
+            [[(0, 4)], [], [(0, 1)]],
+            [[(0, 4)], [], []],
+            [[], [], []],
+        ]
+        stream = StreamLabeler(4, 3, 4, 6)
+        r0 = stream.feed_slice(0, vol[0])
+        r1 = stream.feed_slice(1, vol[1])
+        r2 = stream.feed_slice(2, vol[2])
+        r3 = stream.feed_slice(3, vol[3])
+        self.assertEqual(r0.closed, [])
+        self.assertEqual(r1.closed, [])
+        self.assertEqual(len(r2.closed), 1)
+        self.assertEqual(r2.closed[0].voxel_count, 1)
+        self.assertEqual(len(r3.closed), 1)
+        self.assertEqual(r3.closed[0].voxel_count, 12)
+        finished = stream.finish()
+        self.assertEqual(
+            [(c.min_z, c.min_y, c.min_x) for c in finished.components],
+            [(0, 0, 0), (1, 2, 0)],
+        )
+        self.assertEqual(
+            [c.voxel_count for c in finished.components], [12, 1]
+        )
+        self.assertEqual(finished.id_map[r3.closed[0].temporary_id], 1)
+        self.assertEqual(finished.id_map[r2.closed[0].temporary_id], 2)
+
+    def test_diagonal_cross_slice_depends_on_connectivity(self):
+        vol = [
+            [[(0, 1)], [], []],
+            [[], [(0, 1)], []],
+            [[], [], [(1, 2)]],
+        ]
+        for conn, count, closed_after_first, closed_after_second in (
+            (6, 3, 1, 1),
+            (18, 2, 0, 1),
+            (26, 1, 0, 0),
+        ):
+            stream = StreamLabeler(3, 3, 5, conn)
+            stream.feed_slice(0, vol[0])
+            second = stream.feed_slice(1, vol[1])
+            third = stream.feed_slice(2, vol[2])
+            finished = stream.finish()
+            self.assertEqual(len(second.closed), closed_after_first)
+            self.assertEqual(len(third.closed), closed_after_second)
+            self.assertEqual(len(finished.components), count)
+
+    def test_long_run_state_is_boundary_runs_not_expanded_voxels(self):
+        stream = StreamLabeler(3, 1, 512, 6)
+        stream.feed_slice(0, [[(0, 512)]])
+        self.assertEqual(stream.num_boundary_runs, 1)
+        self.assertEqual(stream.num_active_components, 1)
+        stream.feed_slice(1, [[]])
+        self.assertEqual(stream.num_boundary_runs, 0)
+        self.assertEqual(stream.num_active_components, 0)
+        stream.feed_slice(2, [[]])
+        self.assertEqual(stream.num_active_components, 0)
+        with self.assertRaises(InvalidVolumeError):
+            stream.feed_slice(2, [[]])
+        finished = stream.finish()
+        self.assertEqual(finished.components[0].voxel_count, 512)
+        self.assertEqual(finished.components[0].exposed_area, 2050)
+        with self.assertRaises(InvalidVolumeError):
+            stream.finish()
 
 
 class ErrorSemanticsTests(unittest.TestCase):

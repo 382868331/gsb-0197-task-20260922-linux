@@ -3,7 +3,7 @@
 离线、纯标准库的可复用 Python 库：对**三维二值体按行压缩的半开 x 游程**做
 连通组件标记（connected-component labeling），输出每条游程的组件 ID 以及
 每组件的体素数、轴对齐包围盒、暴露面面积。不展开整个体素，任何时刻只保留
-当前切片与前一切片的游程。
+当前切片与前一切片的游程。流式接口只保留最新边界游程与未封闭组件聚合状态。
 
 ## 运行环境
 
@@ -19,17 +19,18 @@
 # 必要测试（独立 BFS 参考 + 手算小例 + 错误语义）
 python -m unittest discover -s tests -v
 
-# 固定输入演示：三种邻接的不同结果 + 一个被实际触发的非法输入拒绝
+# 固定输入演示：三种邻接、流式封闭事件 + 一个非法输入拒绝
 python demo.py
 ```
 
-demo 只做真实小规模计算，实测约 0.04 秒（远小于 8 秒），不 sleep、
+demo 只做真实小规模计算，实测约 0.04 秒（远小于 90 秒），不 sleep、
 不读外部数据、不打印预录结果。
 
 ## 公开接口
 
 ```python
 from rle_components import label, Run, BoundingBox, Component, LabelResult
+from rle_components import StreamLabeler, SliceResult, FinishResult, ClosedComponent
 
 result = label(runs, depth, height, width, connectivity=6)
 ```
@@ -62,6 +63,23 @@ result = label(runs, depth, height, width, connectivity=6)
 必然等于几何包围盒的 `(min_z,min_y,min_x)`：在 18/26 邻接下，几何上
 `y`/`x` 更小的体素可能只出现在更大的 `z` 切片（测试中明确覆盖此区别）。
 
+## 流式接口
+
+```python
+stream = StreamLabeler(depth, height, width, connectivity=6)
+for z in range(depth):
+    result = stream.feed_slice(z, rows_for_z)
+finish = stream.finish()
+```
+
+* `feed_slice(z, rows)` 的 `z` 必须从 0 开始连续递增；跳片、重复、逆序均拒绝。
+* 空切片必须显式传入长度为 `height` 的全空行序列；未来只能连接相邻 z 切片。
+* `SliceResult.run_labels` 是本切片每条游程的稳定临时 ID；临时 ID 不复用，但不是最终 ID。
+* `SliceResult.closed` 返回本切片后不再接触最新切片的 `ClosedComponent`；其面积和体素数此时已最终确定，并释放活跃合并状态。
+* `FinishResult.components` 在 `finish` 时按最小 `(z,y,x)` 分配最终 ID；`id_map` 包含历史临时 ID 到最终 ID 的映射。
+* `finish` 结算最后仍在边界上的组件，只能调用一次；之后不能继续喂片。
+* `num_active_components` 与 `num_boundary_runs` 可检查工作集；整层空白后均为 0，长游程仍按 1 条边界游程保存。
+
 ## 输入上限（接口边界）
 
 * `depth`、`height`、`width` 各 `<= 512`；
@@ -83,7 +101,8 @@ result = label(runs, depth, height, width, connectivity=6)
   乱序、嵌套结构尺寸与 depth/height 不符、游程数超 20000 等均拒绝。
 
 `label` 是无状态纯函数：输入要么完整通过校验后一次性产出结果，要么抛异常，
-不存在部分结果或部分变更。
+不存在部分结果或部分变更。流式构造函数与每次 `feed_slice` 也先完整校验参数和
+切片，失败时不推进期望 z、不改变活跃组件状态。
 
 ## 算法与设计取舍
 
@@ -98,9 +117,9 @@ result = label(runs, depth, height, width, connectivity=6)
    游程，单行配对为 `O(len(a)+len(b)+触达对数)`，整体近似
    `O(R + 触达游程对)`，`R` 为游程数；区间重叠长度直接给出共享面的
    体素列数。
-3. **不展开体素**。内存只与游程数和两个切片相关（DSU 每节点常数个数组：
-   父指针、体素数、z/y/x0/x1）。20000 游程量级下实测 26 邻接全稀疏体
-   约 0.14 秒。
+3. **不展开体素**。流式内存只与最新边界游程和未封闭组件有关；每个活跃组件
+   保存父指针、体素数、内部面数、包围盒和排序键。封闭组件立即释放活跃状态，
+   只保留调用方已取得的终结记录。
 4. **暴露面积精确计数**。扫描时在 x/y/z 三个面方向各把每个面邻居计一次
    （同游程内部 `length-1` 个面、行内相邻、行间/切片间重叠列），
    `exposed_area = 6 * voxel_count - 2 * internal_face_count`。
@@ -125,7 +144,9 @@ BFS 求组件、逐体素逐方向数暴露面；它不导入、不调用 `rle_c
 * **仅角接触**：`(0,0,0)-(1,1,1)-(2,2,2)` 对角链，6/18 下 3 个组件、
   26 下 1 个；
 * **空行/空切片/空体**；
-* **跨 slice 桥接**：经边接触（dz=1,dy=1）在 18/26 下连通、6 下断开。
+* **跨 slice 桥接**：经边接触（dz=1,dy=1）在 18/26 下连通、6 下断开；
+* **流式专项**：随机切片结果对照 BFS，并覆盖长条夹短条、整层空白释放、斜角跨片、
+  长游程边界计数、跳片拒绝和最终 ID 映射。
 
 “核心结果自身往返一致”不作为正确性依据，只做补充断言（体素守恒、ID 连续
 有序、面积非负偶数值等）。
@@ -135,5 +156,5 @@ BFS 求组件、逐体素逐方向数暴露面；它不导入、不调用 `rle_c
 * 只实现本题规定的 6/18/26 三维栅格连通性与按行 x 游程输入，不宣称兼容
   ITK/VTK/`ndimage` 等行业库的全部标签选项、像素类型或流式协议。
 * 不做体素展开后的形态学操作、不输出体素级标签体（设计上避免展开）。
-* 输入须一次性给出全部切片；不支持增量追加切片的有状态 API。
+* 流式模式要求调用方按 `z=0..depth-1` 喂入所有切片，库不自动补空层或并发喂片。
 * 尺寸与游程数上限为题面给定的 512 / 20000；超过即拒绝而非自动外存化。
