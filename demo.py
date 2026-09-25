@@ -1,16 +1,18 @@
-"""固定输入演示：稀疏 RLE 体的游程连通组件标记。
+"""固定输入演示：稀疏 RLE 体的游程连通组件标记（批式 + 流式）。
 
 运行：python demo.py（Python 3.14，标准库，离线，无需任何参数）。
 
 本脚本真实计算并打印：
   1) 一个固定小体素体在 6 / 18 / 26 三种邻接下的组件结果
      （三者组件数刻意不同：3 / 2 / 1）；
-  2) 一个被实际触发并拒绝的非法输入边界（NaN 游程坐标）。
+  2) 同一体数据改用 StreamLabeler 逐切片喂入：组件封闭即输出终结记录，
+     finish 给出临时 ID -> 最终 ID 映射，结果与批式完全一致；
+  3) 一个被实际触发并拒绝的非法输入边界（NaN 游程坐标）。
 
 不 sleep、不读取外部数据、不使用预录结果。
 """
 
-from rle_components import InvalidVolumeError, label
+from rle_components import InvalidVolumeError, StreamLabeler, label
 
 DEPTH = HEIGHT = WIDTH = 4
 
@@ -93,6 +95,34 @@ def main():
             assert c.exposed_area >= 0
             assert c.exposed_area % 2 == 0  # 任何组件暴露面数均为偶数
     print("验算通过：三种邻接组件数分别为 3/2/1，体素守恒，面积非负偶数值。\n")
+
+    # --- 流式接口：逐切片喂入同一体数据，结果必须与批式一致 ---
+    print("=== 流式接口（StreamLabeler，connectivity=26）===")
+    st = StreamLabeler(HEIGHT, WIDTH, 26)
+    for z, slice_rows in enumerate(vol):
+        out = st.feed_slice(slice_rows)
+        nonempty = [t for row in out.run_labels for t in row]
+        print(
+            f"  z={z}: 本切片游程临时 ID={nonempty or '无'}  "
+            f"新封闭组件={len(out.closed)}  "
+            f"活跃组件={st.active_component_count()}"
+        )
+        for rec in out.closed:
+            print(
+                f"    封闭 temp={rec.temp_id}: 体素={rec.voxel_count}  "
+                f"暴露面积={rec.exposed_area}"
+            )
+    final = st.finish()
+    print(f"  finish: 临时->最终 ID 映射 {final.id_of_temp}")
+    for c in final.components:
+        print(
+            f"  组件 {c.id}: 体素={c.voxel_count}  "
+            f"暴露面积={c.exposed_area}  "
+            f"最小体素=({c.min_z},{c.min_y},{c.min_x})"
+        )
+    # 流式最终结果与批式 label 逐字段一致
+    assert final.components == results[26].components
+    print("验算通过：流式 finish 结果与批式 label(connectivity=26) 完全一致。\n")
 
     # --- 实际触发的拒绝边界：NaN 坐标必须被拒绝（不静默纠正） ---
     print("=== 非法输入边界（NaN 游程坐标）===")

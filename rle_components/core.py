@@ -26,6 +26,15 @@ y+1 行、前一切片的 y 与 y-1 行做区间触达判定并合并；每个�
 * 组件 ID 1 起始，按组件最小体素坐标 (z, y, x) 字典序升序。
 
 全部输出为整数，模块不产生任何浮点结果。
+
+流式接口
+--------
+:class:`StreamLabeler` 按 z 递增逐切片喂入（``feed_slice``），空切片也
+必须显式传入。某组件一旦不再接触最新切片，它不可能再与未来切片相连，
+立即以**稳定临时 ID** 输出终结记录并释放其活跃合并状态；活跃内存只与
+边界切片及未封闭组件相关，不保留全部已展开历史。``finish`` 结算最后
+切片，把所有临时 ID 按组件最小 (z, y, x) 映射为与 :func:`label` 一致
+的最终 ID。
 """
 
 from __future__ import annotations
@@ -40,6 +49,10 @@ __all__ = [
     "BoundingBox",
     "Component",
     "LabelResult",
+    "ClosedComponent",
+    "SliceResult",
+    "StreamResult",
+    "StreamLabeler",
     "InvalidVolumeError",
     "label",
 ]
@@ -152,6 +165,72 @@ def _check_coord(value: object, where: str) -> int:
     return value
 
 
+def _normalize_slice(
+    slice_rows: object, z: int, height: int, width: int, total: int
+) -> tuple[list[list[tuple[int, int]]], int]:
+    """校验并规范化单个切片，返回 (切片, 累计游程数)。"""
+
+    if not isinstance(slice_rows, Sequence) or isinstance(
+        slice_rows, (str, bytes)
+    ):
+        raise InvalidVolumeError(
+            f"z={z}: 切片必须为按行组织的序列，"
+            f"得到 {type(slice_rows).__name__}"
+        )
+    if len(slice_rows) != height:
+        raise InvalidVolumeError(
+            f"z={z}: 行数 {len(slice_rows)} 与 height={height} 不一致"
+        )
+
+    out_slice: list[list[tuple[int, int]]] = []
+    for y, row in enumerate(slice_rows):
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
+            raise InvalidVolumeError(
+                f"z={z} y={y}: 行必须为游程序列，得到 {type(row).__name__}"
+            )
+
+        out_row: list[tuple[int, int]] = []
+        prev_end = 0
+        for ri, run in enumerate(row):
+            where = f"z={z} y={y} run={ri}"
+            if isinstance(run, dict):
+                if set(run) != {"start", "end"}:
+                    raise InvalidVolumeError(
+                        f"{where}: 字典游程只能含键 start/end，得到 {sorted(run)}"
+                    )
+                raw0, raw1 = run["start"], run["end"]
+            elif isinstance(run, Sequence) and not isinstance(
+                run, (str, bytes)
+            ) and len(run) == 2:
+                raw0, raw1 = run[0], run[1]
+            else:
+                raise InvalidVolumeError(
+                    f"{where}: 游程必须为 (start, end) 二元组，得到 {run!r}"
+                )
+
+            x0 = _check_coord(raw0, where + ".start")
+            x1 = _check_coord(raw1, where + ".end")
+            if not 0 <= x0 < x1 <= width:
+                raise InvalidVolumeError(
+                    f"{where}: 要求 0 <= start < end <= width({width})，"
+                    f"得到 start={x0}, end={x1}（空游程/越界均非法）"
+                )
+            if ri > 0 and x0 < prev_end:
+                raise InvalidVolumeError(
+                    f"{where}: 游程必须按 start 升序且互不重叠，"
+                    f"start={x0} 早于上游 end={prev_end}"
+                )
+            out_row.append((x0, x1))
+            prev_end = x1
+            total += 1
+            if total > MAX_RUNS:
+                raise InvalidVolumeError(
+                    f"游程总数超过上限 {MAX_RUNS}（z={z} y={y} run={ri}）"
+                )
+        out_slice.append(out_row)
+    return out_slice, total
+
+
 def _normalize_runs(
     runs: object, depth: int, height: int, width: int
 ) -> list[list[list[tuple[int, int]]]]:
@@ -166,68 +245,9 @@ def _normalize_runs(
 
     normalized: list[list[list[tuple[int, int]]]] = []
     total = 0
-
     for z, slice_rows in enumerate(runs):
-        if not isinstance(slice_rows, Sequence) or isinstance(
-            slice_rows, (str, bytes)
-        ):
-            raise InvalidVolumeError(
-                f"z={z}: 切片必须为按行组织的序列，"
-                f"得到 {type(slice_rows).__name__}"
-            )
-        if len(slice_rows) != height:
-            raise InvalidVolumeError(
-                f"z={z}: 行数 {len(slice_rows)} 与 height={height} 不一致"
-            )
-
-        out_slice: list[list[tuple[int, int]]] = []
-        for y, row in enumerate(slice_rows):
-            if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
-                raise InvalidVolumeError(
-                    f"z={z} y={y}: 行必须为游程序列，得到 {type(row).__name__}"
-                )
-
-            out_row: list[tuple[int, int]] = []
-            prev_end = 0
-            for ri, run in enumerate(row):
-                where = f"z={z} y={y} run={ri}"
-                if isinstance(run, dict):
-                    if set(run) != {"start", "end"}:
-                        raise InvalidVolumeError(
-                            f"{where}: 字典游程只能含键 start/end，得到 {sorted(run)}"
-                        )
-                    raw0, raw1 = run["start"], run["end"]
-                elif isinstance(run, Sequence) and not isinstance(
-                    run, (str, bytes)
-                ) and len(run) == 2:
-                    raw0, raw1 = run[0], run[1]
-                else:
-                    raise InvalidVolumeError(
-                        f"{where}: 游程必须为 (start, end) 二元组，得到 {run!r}"
-                    )
-
-                x0 = _check_coord(raw0, where + ".start")
-                x1 = _check_coord(raw1, where + ".end")
-                if not 0 <= x0 < x1 <= width:
-                    raise InvalidVolumeError(
-                        f"{where}: 要求 0 <= start < end <= width({width})，"
-                        f"得到 start={x0}, end={x1}（空游程/越界均非法）"
-                    )
-                if ri > 0 and x0 < prev_end:
-                    raise InvalidVolumeError(
-                        f"{where}: 游程必须按 start 升序且互不重叠，"
-                        f"start={x0} 早于上游 end={prev_end}"
-                    )
-                out_row.append((x0, x1))
-                prev_end = x1
-                total += 1
-                if total > MAX_RUNS:
-                    raise InvalidVolumeError(
-                        f"游程总数超过上限 {MAX_RUNS}（z={z} y={y} run={ri}）"
-                    )
-            out_slice.append(out_row)
+        out_slice, total = _normalize_slice(slice_rows, z, height, width, total)
         normalized.append(out_slice)
-
     return normalized
 
 
@@ -510,3 +530,364 @@ def label(
         connectivity=connectivity,
         num_runs=total_runs,
     )
+
+
+# ---------------------------------------------------------------------------
+# 流式接口：逐切片喂入，组件封闭即交付终结记录并释放活跃状态
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ClosedComponent:
+    """流式阶段某组件的终结记录（临时身份）。
+
+    Attributes:
+        temp_id: 稳定临时 ID（1 起始，按组件创建先后分配，终身不变）；
+            不是最终 ID，最终 ID 由 :meth:`StreamLabeler.finish` 统一映射。
+        voxel_count / bbox / exposed_area / min_z / min_y / min_x:
+            与 :class:`Component` 同义；组件封闭时这些值即最终确定。
+    """
+
+    temp_id: int
+    voxel_count: int
+    bbox: BoundingBox
+    exposed_area: int
+    min_z: int
+    min_y: int
+    min_x: int
+
+
+@dataclass(frozen=True)
+class SliceResult:
+    """一次 :meth:`StreamLabeler.feed_slice` 的返回。
+
+    Attributes:
+        z: 本次喂入切片的 z 下标（从 0 开始，每次调用递增 1）。
+        run_labels: 本切片每行游程所属组件的临时 ID，
+            形状 `[y] -> [temp_id, ...]`，顺序对应该行输入游程。
+        closed: 本切片处理后被判定封闭的组件终结记录（可能为空）。
+    """
+
+    z: int
+    run_labels: list[list[int]]
+    closed: list[ClosedComponent]
+
+
+@dataclass(frozen=True)
+class StreamResult:
+    """`StreamLabeler.finish` 的返回。
+
+    Attributes:
+        components: 最终组件列表，ID 1 起始、按 (min_z, min_y, min_x)
+            升序，与批式 :func:`label` 的编号口径完全一致。
+        id_of_temp: 临时 ID -> 最终 ID 的映射（覆盖全部组件）。
+        connectivity: 实际使用的连通性。
+        num_runs: 累计喂入的游程总数。
+    """
+
+    components: list[Component]
+    id_of_temp: dict[int, int]
+    connectivity: int
+    num_runs: int
+
+
+class _Agg:
+    """活跃组件的聚合状态（仅未封闭组件持有）。"""
+
+    __slots__ = (
+        "temp_id", "voxels", "faces",
+        "key_z", "key_y", "key_x",
+        "min_z", "min_y", "min_x", "max_z", "max_y", "max_x",
+    )
+
+    def __init__(self, temp_id: int, z: int, y: int, x0: int, x1: int) -> None:
+        self.temp_id = temp_id
+        self.voxels = x1 - x0
+        self.faces = x1 - x0 - 1  # 游程内部 x 方向面邻居
+        self.key_z = z
+        self.key_y = y
+        self.key_x = x0
+        self.min_z = z
+        self.min_y = y
+        self.min_x = x0
+        self.max_z = z + 1
+        self.max_y = y + 1
+        self.max_x = x1
+
+    def absorb(self, other: "_Agg", shared_faces: int) -> None:
+        self.voxels += other.voxels
+        self.faces += other.faces + shared_faces
+        if (other.key_z, other.key_y, other.key_x) < (
+            self.key_z, self.key_y, self.key_x
+        ):
+            self.key_z, self.key_y, self.key_x = (
+                other.key_z, other.key_y, other.key_x,
+            )
+        self.min_z = min(self.min_z, other.min_z)
+        self.min_y = min(self.min_y, other.min_y)
+        self.min_x = min(self.min_x, other.min_x)
+        self.max_z = max(self.max_z, other.max_z)
+        self.max_y = max(self.max_y, other.max_y)
+        self.max_x = max(self.max_x, other.max_x)
+
+    def close(self) -> ClosedComponent:
+        return ClosedComponent(
+            temp_id=self.temp_id,
+            voxel_count=self.voxels,
+            bbox=BoundingBox(
+                self.min_z, self.min_y, self.min_x,
+                self.max_z, self.max_y, self.max_x,
+            ),
+            exposed_area=6 * self.voxels - 2 * self.faces,
+            min_z=self.key_z,
+            min_y=self.key_y,
+            min_x=self.key_x,
+        )
+
+
+class StreamLabeler:
+    """逐切片流式连通组件标记。
+
+    用法::
+
+        st = StreamLabeler(height, width, connectivity=6)
+        for slice_rows in slices:          # z 必须连续递增；空切片也要
+            out = st.feed_slice(slice_rows)  # 显式传 [[]]*height
+            ...out.closed...               # 本切片封闭的组件终结记录
+        final = st.finish()                # 结算尾部，给出最终 ID 映射
+
+    组件一旦不接触最新切片即封闭：其终结记录在当次 `feed_slice` 返回，
+    活跃合并状态随即释放。任意时刻的活跃状态只包含最近切片的边界游程
+    节点与尚未封闭的组件聚合，不保留全部历史游程。
+    """
+
+    def __init__(self, height: int, width: int, connectivity: int = 6) -> None:
+        self._height = _check_dim(height, "height")
+        self._width = _check_dim(width, "width")
+        if (
+            isinstance(connectivity, bool)
+            or not isinstance(connectivity, int)
+            or connectivity not in _VALID_CONNECTIVITY
+        ):
+            raise InvalidVolumeError(
+                f"connectivity 必须为整数 6/18/26 之一（拒绝 bool/float），"
+                f"得到 {type(connectivity).__name__}: {connectivity!r}"
+            )
+        self._connectivity = connectivity
+        self._edge_mode = connectivity >= 18
+        self._corner_mode = connectivity == 26
+
+        self._z = 0
+        self._finished = False
+        self._num_runs = 0
+        self._next_temp = 1
+        self._next_node = 0
+        # 活跃状态：node 为最近两个切片内游程的编号
+        self._parent: dict[int, int] = {}
+        self._aggs: dict[int, _Agg] = {}       # 并查集根 -> 聚合
+        self._prev_rows: list[list[tuple[int, int]]] | None = None
+        self._prev_nodes: list[list[int]] | None = None
+        self._closed: list[_Agg] = []
+        # 被合并吸收、但可能已在历史切片 run_labels 中发布的临时 ID
+        self._alias: dict[int, int] = {}  # 消亡 temp_id -> 幸存 temp_id
+
+    # --  introspection（监控/测试用） --
+
+    def active_node_count(self) -> int:
+        """当前活跃并查集节点数（仅边界切片游程）。"""
+        return len(self._parent)
+
+    def active_component_count(self) -> int:
+        """当前未封闭组件数。"""
+        return len(self._aggs)
+
+    # --  并查集（dict 版，节点随切片滚动释放） --
+
+    def _find(self, n: int) -> int:
+        parent = self._parent
+        root = n
+        while parent[root] != root:
+            root = parent[root]
+        while parent[n] != root:
+            parent[n], n = root, parent[n]
+        return root
+
+    def _union(self, a: int, b: int, shared_faces: int = 0) -> None:
+        ra, rb = self._find(a), self._find(b)
+        if ra == rb:
+            self._aggs[ra].faces += shared_faces
+            return
+        aa, ab = self._aggs[ra], self._aggs[rb]
+        if aa.voxels < ab.voxels:
+            ra, rb, aa, ab = rb, ra, ab, aa
+        aa.absorb(ab, shared_faces)
+        # 临时身份保持稳定：组件终身沿用最早创建时的 temp_id；
+        # 消亡的 temp_id 记录别名，finish 时一并映射到最终 ID
+        if ab.temp_id < aa.temp_id:
+            aa.temp_id, ab.temp_id = ab.temp_id, aa.temp_id
+        self._alias[ab.temp_id] = aa.temp_id
+        self._parent[rb] = ra
+        del self._aggs[rb]
+
+    # --  主流程 --
+
+    def feed_slice(self, slice_rows: object) -> SliceResult:
+        """喂入下一张切片（z 隐式连续递增），返回本切片结果。
+
+        空切片必须显式传入 `[[]] * height`；跳过 z 层会破坏
+        “不接触最新切片即封闭”的判定，属于契约违背。
+
+        Raises:
+            InvalidVolumeError: finish 后再次喂入、切片结构/坐标非法、
+                切片数超过 512 或累计游程超过 20000。
+        """
+        if self._finished:
+            raise InvalidVolumeError("finish 已结算，不能再 feed_slice")
+        if self._z >= MAX_DIM:
+            raise InvalidVolumeError(
+                f"切片数超过上限 depth<={MAX_DIM}（z={self._z}）"
+            )
+        z = self._z
+        height, width = self._height, self._width
+        vol, self._num_runs = _normalize_slice(
+            slice_rows, z, height, width, self._num_runs
+        )
+
+        cur_nodes: list[list[int]] = []
+        flat: list[int] = []
+        for y in range(height):
+            row = vol[y]
+            ids: list[int] = []
+            for s, e in row:
+                nid = self._next_node
+                self._next_node += 1
+                self._parent[nid] = nid
+                self._aggs[nid] = _Agg(self._next_temp, z, y, s, e)
+                self._next_temp += 1
+                ids.append(nid)
+                flat.append(nid)
+            cur_nodes.append(ids)
+
+            # x 方向：同行端点相接（面）
+            for ri in range(1, len(ids)):
+                if row[ri - 1][1] == row[ri][0]:
+                    self._union(ids[ri - 1], ids[ri], 1)
+
+            # y 方向：同切片 y-1 行（面/边）
+            if y - 1 >= 0:
+                other = vol[y - 1]
+                other_ids = cur_nodes[y - 1]
+                for i, j, ov in _pairs(row, other):
+                    if ov > 0:
+                        self._union(ids[i], other_ids[j], ov)
+                    elif self._edge_mode:
+                        self._union(ids[i], other_ids[j])
+
+            # z 方向：前一切片 y-1 / y / y+1 三行（面/边/角）
+            if self._prev_rows is not None:
+                for dy in (-1, 0, 1):
+                    py = y + dy
+                    if not 0 <= py < height:
+                        continue
+                    prow = self._prev_rows[py]
+                    pids = self._prev_nodes[py]
+                    for i, j, ov in _pairs(row, prow):
+                        if dy == 0:
+                            if ov > 0:
+                                self._union(ids[i], pids[j], ov)
+                            elif self._edge_mode:
+                                self._union(ids[i], pids[j])
+                        elif ov > 0:
+                            if self._edge_mode:
+                                self._union(ids[i], pids[j])
+                        elif self._corner_mode:
+                            self._union(ids[i], pids[j])
+
+        # 本切片每游程的临时组件 ID（封闭判定之前取，保证同切片一致）
+        run_labels = [
+            [self._aggs[self._find(nid)].temp_id for nid in ids]
+            for ids in cur_nodes
+        ]
+
+        # 封闭判定：不接触最新切片的组件不可能再与未来切片相连
+        present = {self._find(nid) for nid in flat}
+        closed: list[ClosedComponent] = []
+        for root in list(self._aggs):
+            if root not in present:
+                agg = self._aggs.pop(root)
+                closed.append(agg.close())
+                self._closed.append(agg)
+
+        # 释放活跃状态：把仍活跃组件的根重挂到本切片节点上，
+        # 随后丢弃前一切片的全部节点，只保留边界与未封闭聚合
+        cur_set = set(flat)
+        groups: dict[int, list[int]] = {}
+        for nid in flat:
+            groups.setdefault(self._find(nid), []).append(nid)
+        for root, members in groups.items():
+            new_root = members[0]
+            self._parent[new_root] = new_root
+            for m in members[1:]:
+                self._parent[m] = new_root
+            if root != new_root:
+                self._parent[root] = new_root
+                self._aggs[new_root] = self._aggs.pop(root)
+        if self._prev_nodes is not None:
+            for row_ids in self._prev_nodes:
+                for nid in row_ids:
+                    self._parent.pop(nid, None)
+        # 上一步可能把旧根重定向到本切片节点后又删掉旧根条目，无影响
+
+        self._prev_rows = vol
+        self._prev_nodes = cur_nodes
+        self._z += 1
+        return SliceResult(z=z, run_labels=run_labels, closed=closed)
+
+    def finish(self) -> StreamResult:
+        """结算最后切片：封闭全部剩余组件，返回最终 ID 映射。
+
+        最终 ID 1 起始、按组件最小 (z, y, x) 升序，与批式 :func:`label`
+        的编号一致；临时 ID 只按创建次序分配，不按提前结束次序冒充原 ID。
+        只能调用一次。
+        """
+        if self._finished:
+            raise InvalidVolumeError("finish 只能调用一次")
+        self._finished = True
+
+        for root in list(self._aggs):
+            self._closed.append(self._aggs.pop(root))
+        self._parent.clear()
+        self._prev_rows = None
+        self._prev_nodes = None
+
+        ordered = sorted(
+            self._closed, key=lambda a: (a.key_z, a.key_y, a.key_x)
+        )
+        components: list[Component] = []
+        id_of_temp: dict[int, int] = {}
+        for cid, agg in enumerate(ordered, start=1):
+            id_of_temp[agg.temp_id] = cid
+            rec = agg.close()
+            components.append(
+                Component(
+                    id=cid,
+                    voxel_count=rec.voxel_count,
+                    bbox=rec.bbox,
+                    exposed_area=rec.exposed_area,
+                    min_z=rec.min_z,
+                    min_y=rec.min_y,
+                    min_x=rec.min_x,
+                )
+            )
+        # 消亡临时 ID 沿别名链解析到幸存身份，再映射到同一最终 ID
+        for temp in self._alias:
+            root = temp
+            while root in self._alias:
+                root = self._alias[root]
+            id_of_temp[temp] = id_of_temp[root]
+        return StreamResult(
+            components=components,
+            id_of_temp=id_of_temp,
+            connectivity=self._connectivity,
+            num_runs=self._num_runs,
+        )
