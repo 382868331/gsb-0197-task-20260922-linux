@@ -6,17 +6,27 @@
 from .core import (
     BoundingBox,
     Component,
+    Contact,
     InvalidVolumeError,
     LabelResult,
+    MaterialComponent,
+    MaterialLabelResult,
+    MaterialRun,
     Run,
     label,
+    label_materials,
 )
 
 __all__ = [
     "BoundingBox",
     "Component",
+    "Contact",
     "InvalidVolumeError",
     "LabelResult",
+    "MaterialComponent",
+    "MaterialLabelResult",
+    "MaterialRun",
     "Run",
     "label",
+    "label_materials",
 ]

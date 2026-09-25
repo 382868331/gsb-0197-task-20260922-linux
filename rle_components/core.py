@@ -42,6 +42,11 @@ __all__ = [
     "LabelResult",
     "InvalidVolumeError",
     "label",
+    "MaterialRun",
+    "MaterialComponent",
+    "Contact",
+    "MaterialLabelResult",
+    "label_materials",
 ]
 
 # 接口边界（题面给定）
@@ -279,12 +284,13 @@ def _pairs(a_runs, b_runs):
         return
     n = len(b_runs)
     j = 0
-    for i, (s0, e0) in enumerate(a_runs):
+    for i, ra in enumerate(a_runs):
+        s0, e0 = ra[0], ra[1]
         while j < n and b_runs[j][1] < s0:
             j += 1
         k = j
         while k < n and b_runs[k][0] <= e0:
-            s1, e1 = b_runs[k]
+            s1, e1 = b_runs[k][0], b_runs[k][1]
             ov = e0 if e0 < e1 else e1
             ms = s0 if s0 > s1 else s1
             yield i, k, ov - ms
@@ -507,6 +513,440 @@ def label(
     return LabelResult(
         run_labels=run_labels,
         components=components,
+        connectivity=connectivity,
+        num_runs=total_runs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 多材料扩展：label_materials
+#
+# 与二值 label 的区别：
+#   * 每条游程携带非负整数材料号，只有材料相同才允许合并（6/18/26 的
+#     几何判定不变）；
+#   * 不同材料的组件即使面贴面也保持分离，其共享的方形体素面数记入
+#     接触表 contacts；边/角接触面积为 0，不进表；
+#   * 组件的 exposed_area 只对空白（无游程区域，含体积外侧）计数，
+#     与其他组件相接的面不算暴露：
+#     exposed = 6*体素数 - 2*内部面数 - 接触面总数。
+# ---------------------------------------------------------------------------
+
+
+class MaterialRun(NamedTuple):
+    """单条带材料的半开 x 游程：覆盖 x in [start, end)，材料号 material。"""
+
+    start: int
+    end: int
+    material: int
+
+
+class Contact(NamedTuple):
+    """一对组件之间共享的方形体素面数。
+
+    每对组件只出现一次，component_a 为较小 ID；边/角接触面积为 0，
+    不会产生 Contact 条目。
+    """
+
+    component_a: int
+    component_b: int
+    area: int
+
+
+@dataclass(frozen=True)
+class MaterialComponent:
+    """多材料标记下一个连通组件的聚合结果。
+
+    Attributes:
+        id: 1 起始组件 ID，按 (min_z, min_y, min_x) 升序。
+        material: 组件材料号（组件内所有体素材料相同）。
+        voxel_count: 组件体素总数。
+        bbox: 轴对齐包围盒（半开区间）。
+        exposed_area: 对空白暴露的面面积 = 6*voxel_count - 2*内部面数
+            - 与其他组件的接触面总数。
+        min_z/min_y/min_x: 组件字典序最小体素坐标（= ID 排序键）。
+    """
+
+    id: int
+    material: int
+    voxel_count: int
+    bbox: BoundingBox
+    exposed_area: int
+    min_z: int
+    min_y: int
+    min_x: int
+
+
+@dataclass(frozen=True)
+class MaterialLabelResult:
+    """``label_materials`` 的返回值。
+
+    Attributes:
+        run_labels: 与输入同形的嵌套列表 ``[z][y] -> [component_id, ...]``。
+        components: :class:`MaterialComponent` 列表，ID 为 1..N。
+        contacts: :class:`Contact` 列表，按 (component_a, component_b)
+            升序，每对组件至多一条。
+        connectivity: 实际使用的连通性（6/18/26）。
+        num_runs: 输入游程总数。
+    """
+
+    run_labels: list[list[list[int]]]
+    components: list[MaterialComponent]
+    contacts: list[Contact]
+    connectivity: int
+    num_runs: int
+
+    def component_at(self, z: int, y: int, run_index: int) -> MaterialComponent:
+        """返回 (z, y) 行内第 run_index 条游程所属的组件。"""
+
+        cid = self.run_labels[z][y][run_index]
+        return self.components[cid - 1]
+
+    def contact_between(self, cid_a: int, cid_b: int) -> int:
+        """两个组件间的接触面积；不接触为 0。"""
+
+        a, b = (cid_a, cid_b) if cid_a < cid_b else (cid_b, cid_a)
+        for c in self.contacts:
+            if c.component_a == a and c.component_b == b:
+                return c.area
+        return 0
+
+
+def _check_material(value: object, where: str) -> int:
+    if isinstance(value, float):
+        if value != value or value in (inf, -inf):
+            raise InvalidVolumeError(
+                f"{where} 不能为 NaN 或 Infinity，得到 {value!r}"
+            )
+        raise InvalidVolumeError(
+            f"{where} 材料号必须为整数，得到 float: {value!r}"
+        )
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidVolumeError(
+            f"{where} 材料号必须为整数（拒绝 bool），"
+            f"得到 {type(value).__name__}: {value!r}"
+        )
+    if value < 0:
+        raise InvalidVolumeError(
+            f"{where} 材料号必须为非负整数，得到 {value}"
+        )
+    return value
+
+
+def _normalize_material_runs(
+    runs: object, depth: int, height: int, width: int
+) -> list[list[list[tuple[int, int, int]]]]:
+    if not isinstance(runs, Sequence) or isinstance(runs, (str, bytes)):
+        raise InvalidVolumeError(
+            f"runs 必须为按切片组织的序列，得到 {type(runs).__name__}"
+        )
+    if len(runs) != depth:
+        raise InvalidVolumeError(
+            f"runs 切片数 {len(runs)} 与 depth={depth} 不一致"
+        )
+
+    normalized: list[list[list[tuple[int, int, int]]]] = []
+    total = 0
+
+    for z, slice_rows in enumerate(runs):
+        if not isinstance(slice_rows, Sequence) or isinstance(
+            slice_rows, (str, bytes)
+        ):
+            raise InvalidVolumeError(
+                f"z={z}: 切片必须为按行组织的序列，"
+                f"得到 {type(slice_rows).__name__}"
+            )
+        if len(slice_rows) != height:
+            raise InvalidVolumeError(
+                f"z={z}: 行数 {len(slice_rows)} 与 height={height} 不一致"
+            )
+
+        out_slice: list[list[tuple[int, int, int]]] = []
+        for y, row in enumerate(slice_rows):
+            if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
+                raise InvalidVolumeError(
+                    f"z={z} y={y}: 行必须为游程序列，得到 {type(row).__name__}"
+                )
+
+            out_row: list[tuple[int, int, int]] = []
+            prev_end = 0
+            for ri, run in enumerate(row):
+                where = f"z={z} y={y} run={ri}"
+                if isinstance(run, dict):
+                    if set(run) != {"start", "end", "material"}:
+                        raise InvalidVolumeError(
+                            f"{where}: 字典游程只能含键 start/end/material，"
+                            f"得到 {sorted(run)}"
+                        )
+                    raw0, raw1, rawm = (
+                        run["start"],
+                        run["end"],
+                        run["material"],
+                    )
+                elif isinstance(run, Sequence) and not isinstance(
+                    run, (str, bytes)
+                ) and len(run) == 3:
+                    raw0, raw1, rawm = run[0], run[1], run[2]
+                else:
+                    raise InvalidVolumeError(
+                        f"{where}: 游程必须为 (start, end, material) 三元组，"
+                        f"得到 {run!r}"
+                    )
+
+                x0 = _check_coord(raw0, where + ".start")
+                x1 = _check_coord(raw1, where + ".end")
+                m = _check_material(rawm, where + ".material")
+                if not 0 <= x0 < x1 <= width:
+                    raise InvalidVolumeError(
+                        f"{where}: 要求 0 <= start < end <= width({width})，"
+                        f"得到 start={x0}, end={x1}（空游程/越界均非法）"
+                    )
+                if ri > 0 and x0 < prev_end:
+                    raise InvalidVolumeError(
+                        f"{where}: 游程必须按 start 升序且互不重叠，"
+                        f"start={x0} 早于上游 end={prev_end}"
+                    )
+                out_row.append((x0, x1, m))
+                prev_end = x1
+                total += 1
+                if total > MAX_RUNS:
+                    raise InvalidVolumeError(
+                        f"游程总数超过上限 {MAX_RUNS}（z={z} y={y} run={ri}）"
+                    )
+            out_slice.append(out_row)
+        normalized.append(out_slice)
+
+    return normalized
+
+
+def label_materials(
+    runs: object,
+    depth: int,
+    height: int,
+    width: int,
+    connectivity: int = 6,
+) -> MaterialLabelResult:
+    """对 RLE 多材料体做分材料连通组件标记与接触面积统计。
+
+    Args:
+        runs: ``[z][y] -> [(start, end, material), ...]``；游程可为
+            :class:`MaterialRun`、三元组/列表，或
+            ``{"start": int, "end": int, "material": int}`` 字典。
+            material 为非负整数；空白区域仍由没有游程表示。
+            每行游程按 start 升序、互不重叠（端点相接合法）。
+        depth / height / width: 尺寸，1..512（与二值接口相同上限）。
+        connectivity: 6 / 18 / 26；只有材料相同的游程才按此合并。
+
+    Returns:
+        :class:`MaterialLabelResult`。组件 ID 按最小体素 (z,y,x) 升序；
+        contacts 只统计共享的方形体素面（与连通性选择无关，26 邻接
+        不会把边/角接触算进面积），每对组件按较小 ID 在前只列一次。
+
+    Raises:
+        InvalidVolumeError: 契约违背（材料号为负/bool/float、坐标非法、
+            重叠/乱序、超上限等），消息带 z/y/run 定位。
+    """
+
+    depth = _check_dim(depth, "depth")
+    height = _check_dim(height, "height")
+    width = _check_dim(width, "width")
+    if (
+        isinstance(connectivity, bool)
+        or not isinstance(connectivity, int)
+        or connectivity not in _VALID_CONNECTIVITY
+    ):
+        raise InvalidVolumeError(
+            f"connectivity 必须为整数 6/18/26 之一（拒绝 bool/float），"
+            f"得到 {type(connectivity).__name__}: {connectivity!r}"
+        )
+
+    vol = _normalize_material_runs(runs, depth, height, width)
+    edge_mode = connectivity >= 18
+    corner_mode = connectivity == 26
+
+    total_runs = sum(len(row) for sl in vol for row in sl)
+    dsu = _DSU(total_runs)
+    # 所有“面相邻”游程对的共享面数（同材料为内部面，异材料为接触面，
+    # 并查集完成后按根分类）；每对仅在一个方向计一次
+    face_pairs: list[tuple[int, int, int]] = []
+
+    node_z: list[int] = []
+    node_y: list[int] = []
+    node_x0: list[int] = []
+    node_x1: list[int] = []
+    node_mat: list[int] = []
+    nodes_by: list[list[list[int]]] = []
+
+    prev_nodes: list[list[int]] | None = None
+    next_id = 0
+
+    for z in range(depth):
+        cur_nodes: list[list[int]] = []
+        nodes_by.append(cur_nodes)
+        for y in range(height):
+            row = vol[z][y]
+            ids: list[int] = []
+            for s, e, m in row:
+                nid = next_id
+                next_id += 1
+                dsu.size[nid] = e - s
+                face_pairs.append((nid, nid, e - s - 1))
+                node_z.append(z)
+                node_y.append(y)
+                node_x0.append(s)
+                node_x1.append(e)
+                node_mat.append(m)
+                ids.append(nid)
+            cur_nodes.append(ids)
+
+            # --- x 方向：同行相邻游程端点相接 → 共享 1 个面 ---
+            for ri in range(1, len(ids)):
+                if row[ri - 1][1] == row[ri][0]:
+                    face_pairs.append((ids[ri - 1], ids[ri], 1))
+                    if row[ri - 1][2] == row[ri][2]:
+                        dsu.union(ids[ri - 1], ids[ri])
+
+            # --- y 方向：同切片 y-1 行 ---
+            if y - 1 >= 0:
+                other = vol[z][y - 1]
+                other_ids = cur_nodes[y - 1]
+                for i, j, ov in _pairs(row, other):
+                    if ov > 0:
+                        # x 重叠 → 面接触，逐体素计面；同材料才合并
+                        face_pairs.append((ids[i], other_ids[j], ov))
+                        if row[i][2] == other[j][2]:
+                            dsu.union(ids[i], other_ids[j])
+                    elif edge_mode and row[i][2] == other[j][2]:
+                        # 端点相接（dy=1, dx=1）→ 边接触，面积为 0
+                        dsu.union(ids[i], other_ids[j])
+
+            # --- z 方向：前一切片的 y-1 / y / y+1 三行 ---
+            if prev_nodes is not None:
+                for dy in (-1, 0, 1):
+                    py = y + dy
+                    if not 0 <= py < height:
+                        continue
+                    prow = vol[z - 1][py]
+                    pids = prev_nodes[py]
+                    for i, j, ov in _pairs(row, prow):
+                        same = row[i][2] == prow[j][2]
+                        if dy == 0:
+                            if ov > 0:
+                                # dz=1, dy=0, x 重叠 → 面接触
+                                face_pairs.append((ids[i], pids[j], ov))
+                                if same:
+                                    dsu.union(ids[i], pids[j])
+                            elif edge_mode and same:
+                                # dz=1, dy=0, dx=1 → 边接触
+                                dsu.union(ids[i], pids[j])
+                        else:
+                            if ov > 0:
+                                # dz=1, |dy|=1, x 重叠 → 边接触
+                                if edge_mode and same:
+                                    dsu.union(ids[i], pids[j])
+                            else:
+                                # dz=1, |dy|=1, dx=1 → 角接触
+                                if corner_mode and same:
+                                    dsu.union(ids[i], pids[j])
+
+        prev_nodes = cur_nodes
+
+    # ------------------------------------------------------------------
+    # 聚合：排序键、包围盒与二值版相同；面邻居对按根分为内部面/接触面
+    # ------------------------------------------------------------------
+
+    n = total_runs
+    key_z = [0] * n
+    key_y = [0] * n
+    key_x = [0] * n
+    min_z = [0] * n
+    min_y = [0] * n
+    min_x = [0] * n
+    max_z = [0] * n
+    max_y = [0] * n
+    max_x = [0] * n
+    seen: set[int] = set()
+
+    for nid in range(n):
+        r = dsu.find(nid)
+        z, y, x0, x1 = node_z[nid], node_y[nid], node_x0[nid], node_x1[nid]
+        if r not in seen:
+            seen.add(r)
+            key_z[r] = z
+            key_y[r] = y
+            key_x[r] = x0
+            min_z[r] = z
+            min_y[r] = y
+            min_x[r] = x0
+            max_z[r] = z + 1
+            max_y[r] = y + 1
+            max_x[r] = x1
+        else:
+            if z < min_z[r]:
+                min_z[r] = z
+            if y < min_y[r]:
+                min_y[r] = y
+            if x0 < min_x[r]:
+                min_x[r] = x0
+            if z + 1 > max_z[r]:
+                max_z[r] = z + 1
+            if y + 1 > max_y[r]:
+                max_y[r] = y + 1
+            if x1 > max_x[r]:
+                max_x[r] = x1
+
+    internal_faces = [0] * n
+    contact_by_root: dict[tuple[int, int], int] = {}
+    contact_total = [0] * n  # 每根与其他组件的接触面总数
+    for a, b, count in face_pairs:
+        ra, rb = dsu.find(a), dsu.find(b)
+        if ra == rb:
+            internal_faces[ra] += count
+        else:
+            key = (ra, rb) if ra < rb else (rb, ra)
+            contact_by_root[key] = contact_by_root.get(key, 0) + count
+            contact_total[ra] += count
+            contact_total[rb] += count
+
+    roots = sorted(seen, key=lambda r: (key_z[r], key_y[r], key_x[r]))
+    root_to_cid = {r: cid for cid, r in enumerate(roots, start=1)}
+
+    components: list[MaterialComponent] = []
+    for cid, r in enumerate(roots, start=1):
+        voxels = dsu.size[r]
+        area = 6 * voxels - 2 * internal_faces[r] - contact_total[r]
+        bbox = BoundingBox(
+            min_z[r], min_y[r], min_x[r], max_z[r], max_y[r], max_x[r]
+        )
+        components.append(
+            MaterialComponent(
+                id=cid,
+                material=node_mat[r],
+                voxel_count=voxels,
+                bbox=bbox,
+                exposed_area=area,
+                min_z=key_z[r],
+                min_y=key_y[r],
+                min_x=key_x[r],
+            )
+        )
+
+    contacts = sorted(
+        Contact(
+            *sorted((root_to_cid[ra], root_to_cid[rb])),
+            area,
+        )
+        for (ra, rb), area in contact_by_root.items()
+    )
+
+    run_labels = [
+        [[root_to_cid[dsu.find(nid)] for nid in row_ids] for row_ids in sl]
+        for sl in nodes_by
+    ]
+
+    return MaterialLabelResult(
+        run_labels=run_labels,
+        components=components,
+        contacts=contacts,
         connectivity=connectivity,
         num_runs=total_runs,
     )
