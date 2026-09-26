@@ -5,18 +5,24 @@
 
 from .core import (
     BoundingBox,
+    Cavity,
+    CavityResult,
     Component,
     InvalidVolumeError,
     LabelResult,
     Run,
+    find_cavities,
     label,
 )
 
 __all__ = [
     "BoundingBox",
+    "Cavity",
+    "CavityResult",
     "Component",
     "InvalidVolumeError",
     "LabelResult",
     "Run",
+    "find_cavities",
     "label",
 ]

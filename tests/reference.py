@@ -100,3 +100,90 @@ def reference_label(vol, depth, height, width, connectivity):
         run_labels.append(sl)
 
     return run_labels, meta
+
+
+def reference_cavities(vol, depth, height, width):
+    """独立空腔参考：前景 6 邻接、背景 26 邻接，逐体素 BFS。
+
+    返回 list of dict：keys = min, voxels, bbox, touching（升序元组），
+    按 min 升序。与盒外连通的背景（触及盒任一边界面）不算空腔。
+    """
+    voxels = expand(vol, depth, height, width)
+
+    # 前景组件（6 邻接）：体素 -> 组件 ID（与 reference_label 同口径）
+    _, fg_meta = reference_label(vol, depth, height, width, 6)
+    fg_id = {}
+    # 重新逐体素求前景组件 ID（直接 BFS，不复用 run_labels 输出）
+    fg_seen = set()
+    ordered = []
+    for start in sorted(voxels):
+        if start in fg_seen:
+            continue
+        q = deque([start])
+        fg_seen.add(start)
+        comp = set()
+        while q:
+            v = q.popleft()
+            comp.add(v)
+            z, y, x = v
+            for dz, dy, dx in _NEIGHBORS[6]:
+                w = (z + dz, y + dy, x + dx)
+                if w in voxels and w not in fg_seen:
+                    fg_seen.add(w)
+                    q.append(w)
+        ordered.append(comp)
+    ordered.sort(key=min)
+    for cid, comp in enumerate(ordered, start=1):
+        for v in comp:
+            fg_id[v] = cid
+    assert len(ordered) == len(fg_meta)
+
+    # 背景成分（26 邻接，限制在盒内）
+    bg_seen = set()
+    cavities = []
+    for z in range(depth):
+        for y in range(height):
+            for x in range(width):
+                seed = (z, y, x)
+                if seed in voxels or seed in bg_seen:
+                    continue
+                q = deque([seed])
+                bg_seen.add(seed)
+                comp = set()
+                touches_outside = False
+                while q:
+                    v = q.popleft()
+                    comp.add(v)
+                    vz, vy, vx = v
+                    if (vz == 0 or vz == depth - 1 or vy == 0
+                            or vy == height - 1 or vx == 0 or vx == width - 1):
+                        touches_outside = True
+                    for dz, dy, dx in _NEIGHBORS[26]:
+                        w = (vz + dz, vy + dy, vx + dx)
+                        if (w in bg_seen or w in voxels
+                                or not (0 <= w[0] < depth
+                                        and 0 <= w[1] < height
+                                        and 0 <= w[2] < width)):
+                            continue
+                        bg_seen.add(w)
+                        q.append(w)
+                if touches_outside:
+                    continue
+                touching = set()
+                for (vz, vy, vx) in comp:
+                    for dz, dy, dx in _NEIGHBORS[6]:
+                        w = (vz + dz, vy + dy, vx + dx)
+                        if w in fg_id:
+                            touching.add(fg_id[w])
+                zs = [v[0] for v in comp]
+                ys = [v[1] for v in comp]
+                xs = [v[2] for v in comp]
+                cavities.append({
+                    "min": min(comp),
+                    "voxels": len(comp),
+                    "bbox": (min(zs), min(ys), min(xs),
+                             max(zs) + 1, max(ys) + 1, max(xs) + 1),
+                    "touching": tuple(sorted(touching)),
+                })
+    cavities.sort(key=lambda c: c["min"])
+    return cavities

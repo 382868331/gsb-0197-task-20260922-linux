@@ -40,8 +40,11 @@ __all__ = [
     "BoundingBox",
     "Component",
     "LabelResult",
+    "Cavity",
+    "CavityResult",
     "InvalidVolumeError",
     "label",
+    "find_cavities",
 ]
 
 # 接口边界（题面给定）
@@ -119,6 +122,47 @@ class InvalidVolumeError(ValueError):
 
     消息中带 ``z=.. y=.. run=..`` 等定位前缀；非法输入绝不被静默纠正。
     """
+
+
+@dataclass(frozen=True)
+class Cavity:
+    """一个封闭背景空腔的聚合结果。
+
+    Attributes:
+        id: 1 起始空腔 ID，按空腔最小体素坐标 (z, y, x) 字典序升序。
+        voxel_count: 空腔背景体素总数。
+        bbox: 空腔轴对齐包围盒（半开区间）。
+        touching_components: 与该空腔面接触（6 邻接意义下共享体素面）
+            的前景组件 ID 元组，升序去重；ID 口径与
+            ``label(..., connectivity=6)`` 一致。
+        min_z/min_y/min_x: 空腔字典序最小体素坐标（ID 排序键）。
+    """
+
+    id: int
+    voxel_count: int
+    bbox: BoundingBox
+    touching_components: tuple[int, ...]
+    min_z: int
+    min_y: int
+    min_x: int
+
+
+@dataclass(frozen=True)
+class CavityResult:
+    """``find_cavities`` 的返回值。
+
+    Attributes:
+        cavities: 封闭空腔列表，ID 1..N 按最小 (z, y, x) 升序。
+            与盒外连通的背景（含开放凹槽）不在其中。
+        foreground: 同一输入在 6 邻接下的前景组件结果
+            （``Cavity.touching_components`` 引用其组件 ID）。
+        background_components: 背景 26 邻接连通成分总数
+            （含与盒外连通的成分，不含虚拟“外部”节点本身）。
+    """
+
+    cavities: list[Cavity]
+    foreground: LabelResult
+    background_components: int
 
 
 # ---------------------------------------------------------------------------
@@ -509,4 +553,234 @@ def label(
         components=components,
         connectivity=connectivity,
         num_runs=total_runs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 封闭空腔查询（前景固定 6 邻接，背景固定 26 邻接）
+# ---------------------------------------------------------------------------
+
+
+def _complement_row(fg_row: list[tuple[int, int]], width: int):
+    """一行前景游程在 [0, width) 内的补集（背景游程，有序不重叠）。"""
+
+    bg = []
+    prev = 0
+    for s, e in fg_row:
+        if s > prev:
+            bg.append((prev, s))
+        prev = e
+    if prev < width:
+        bg.append((prev, width))
+    return bg
+
+
+def _overlap_indices(x0: int, x1: int, row):
+    """产出 row 中与 [x0, x1) 严格重叠（共享体素列）的游程下标。"""
+
+    for j, (s, e) in enumerate(row):
+        if e <= x0:
+            continue
+        if s >= x1:
+            break
+        yield j
+
+
+def find_cavities(
+    runs: object,
+    depth: int,
+    height: int,
+    width: int,
+) -> CavityResult:
+    """在有限包围盒内查询封闭背景空腔。
+
+    前景按 6 邻接（仅面接触）求组件，背景按 26 邻接（面+边+角）求
+    连通成分；与盒外连通的背景成分（触及包围盒任一边界面）不是空腔，
+    开放凹槽、贯穿孔道、只开一个角点的孔道都因此正确排除。
+
+    核心按游程工作：背景由每行前景游程的补集给出，行间/切片间用
+    半开区间重叠维护连接，巨大空白区域只贡献每行一条背景游程，
+    绝不逐体素展开。
+
+    Args:
+        runs: 与 :func:`label` 相同的 RLE 输入。
+        depth / height / width: 调用方给出的有限包围盒尺寸，1..512。
+            盒外一律视为“外部”，触及盒边界的背景即与外部连通。
+
+    Returns:
+        :class:`CavityResult`，含每个封闭空腔的体素体积、半开包围盒、
+        面接触的前景组件 ID（ID 口径同 `label(..., 6)`）。
+
+    Raises:
+        InvalidVolumeError: 与 :func:`label` 相同的契约校验。
+    """
+
+    depth = _check_dim(depth, "depth")
+    height = _check_dim(height, "height")
+    width = _check_dim(width, "width")
+    vol = _normalize_runs(runs, depth, height, width)
+
+    # 前景组件（固定 6 邻接；vol 已规范化，二次校验开销可忽略）
+    fg = label(vol, depth, height, width, 6)
+
+    # --- 背景游程：每行前景补集；空行/空切片只产生一条整行游程 ---
+    bg_vol: list[list[list[tuple[int, int]]]] = [
+        [_complement_row(row, width) for row in sl]
+        for sl in vol
+    ]
+
+    total_bg = sum(len(row) for sl in bg_vol for row in sl)
+    outside = total_bg  # 虚拟“盒外”节点下标
+    dsu = _DSU(total_bg + 1)
+
+    node_z: list[int] = []
+    node_y: list[int] = []
+    node_x0: list[int] = []
+    node_x1: list[int] = []
+    nodes_by: list[list[list[int]]] = []
+
+    prev_nodes: list[list[int]] | None = None
+    next_id = 0
+
+    for z in range(depth):
+        cur_nodes: list[list[int]] = []
+        nodes_by.append(cur_nodes)
+        for y in range(height):
+            row = bg_vol[z][y]
+            ids: list[int] = []
+            for s, e in row:
+                nid = next_id
+                next_id += 1
+                dsu.size[nid] = e - s
+                node_z.append(z)
+                node_y.append(y)
+                node_x0.append(s)
+                node_x1.append(e)
+                ids.append(nid)
+                # 触及盒任一边界面 → 与盒外连通（边界洞口保留为开放）
+                if (
+                    z == 0
+                    or z == depth - 1
+                    or y == 0
+                    or y == height - 1
+                    or s == 0
+                    or e == width
+                ):
+                    dsu.union(nid, outside)
+            cur_nodes.append(ids)
+
+            # 同行背景游程被前景游程隔开（间隙 >= 1），不存在 x 向合并。
+
+            # --- 同切片 y-1 行：26 邻接下面/边/角（dx<=1）全部合并 ---
+            if y - 1 >= 0:
+                other_ids = cur_nodes[y - 1]
+                for i, j, _ov in _pairs(row, bg_vol[z][y - 1]):
+                    dsu.union(ids[i], other_ids[j])
+
+            # --- 前一切片 y-1 / y / y+1 三行：dz=1 下 dx,dy<=1 全合并 ---
+            if prev_nodes is not None:
+                for dy in (-1, 0, 1):
+                    py = y + dy
+                    if not 0 <= py < height:
+                        continue
+                    pids = prev_nodes[py]
+                    for i, j, _ov in _pairs(row, bg_vol[z - 1][py]):
+                        dsu.union(ids[i], pids[j])
+
+        prev_nodes = cur_nodes
+
+    outside_root = dsu.find(outside)
+
+    # --- 聚合背景成分：体积、包围盒、排序键（节点创建序即字典序） ---
+    n = total_bg
+    key_z = [0] * n
+    key_y = [0] * n
+    key_x = [0] * n
+    min_z = [0] * n
+    min_y = [0] * n
+    min_x = [0] * n
+    max_z = [0] * n
+    max_y = [0] * n
+    max_x = [0] * n
+    seen: set[int] = set()
+
+    for nid in range(n):
+        r = dsu.find(nid)
+        if r == outside_root:
+            continue
+        z, y, x0, x1 = node_z[nid], node_y[nid], node_x0[nid], node_x1[nid]
+        if r not in seen:
+            seen.add(r)
+            key_z[r] = z
+            key_y[r] = y
+            key_x[r] = x0
+            min_z[r] = z
+            min_y[r] = y
+            min_x[r] = x0
+            max_z[r] = z + 1
+            max_y[r] = y + 1
+            max_x[r] = x1
+        else:
+            if z < min_z[r]:
+                min_z[r] = z
+            if y < min_y[r]:
+                min_y[r] = y
+            if x0 < min_x[r]:
+                min_x[r] = x0
+            if z + 1 > max_z[r]:
+                max_z[r] = z + 1
+            if y + 1 > max_y[r]:
+                max_y[r] = y + 1
+            if x1 > max_x[r]:
+                max_x[r] = x1
+
+    # --- 接触前景：空腔背景游程与前景游程共享体素面（6 邻接） ---
+    contacts: dict[int, set[int]] = {r: set() for r in seen}
+    fg_labels = fg.run_labels
+    for nid in range(n):
+        r = dsu.find(nid)
+        if r == outside_root:
+            continue
+        z, y, x0, x1 = node_z[nid], node_y[nid], node_x0[nid], node_x1[nid]
+        bucket = contacts[r]
+        # 同一行：端点相接的前景游程（dx 面接触）
+        fg_row = vol[z][y]
+        for j, (s, e) in enumerate(fg_row):
+            if e == x0 or s == x1:
+                bucket.add(fg_labels[z][y][j])
+        # 同切片 y±1 行：x 严格重叠（dy 面接触）
+        for ny in (y - 1, y + 1):
+            if 0 <= ny < height:
+                for j in _overlap_indices(x0, x1, vol[z][ny]):
+                    bucket.add(fg_labels[z][ny][j])
+        # 相邻切片同一行：x 严格重叠（dz 面接触）
+        for nz in (z - 1, z + 1):
+            if 0 <= nz < depth:
+                for j in _overlap_indices(x0, x1, vol[nz][y]):
+                    bucket.add(fg_labels[nz][y][j])
+
+    roots = sorted(seen, key=lambda r: (key_z[r], key_y[r], key_x[r]))
+    cavities: list[Cavity] = []
+    for cid, r in enumerate(roots, start=1):
+        cavities.append(
+            Cavity(
+                id=cid,
+                voxel_count=dsu.size[r],
+                bbox=BoundingBox(
+                    min_z[r], min_y[r], min_x[r],
+                    max_z[r], max_y[r], max_x[r],
+                ),
+                touching_components=tuple(sorted(contacts[r])),
+                min_z=key_z[r],
+                min_y=key_y[r],
+                min_x=key_x[r],
+            )
+        )
+
+    # 背景成分总数（不含虚拟外部节点）：空腔根 + 与外部连通的根
+    bg_roots = {dsu.find(nid) for nid in range(n)}
+    return CavityResult(
+        cavities=cavities,
+        foreground=fg,
+        background_components=len(bg_roots),
     )
