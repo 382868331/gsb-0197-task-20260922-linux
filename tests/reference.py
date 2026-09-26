@@ -100,3 +100,91 @@ def reference_label(vol, depth, height, width, connectivity):
         run_labels.append(sl)
 
     return run_labels, meta
+
+
+def reference_cavities(vol, depth, height, width, box):
+    """独立空腔参考：体素展开 + BFS，不调用被测核心。
+
+    box: (min_z, min_y, min_x, max_z, max_y, max_x) 半开区间。
+    返回 list of dict(min, voxels, bbox, touches)，按最小 (z,y,x) 升序。
+    touches 为盒内 6 邻接前景组件 ID（ID 规则：全 volume 前景 6 邻接
+    BFS 后按最小体素字典序 1 起始，与 label 的排序键一致）。
+    """
+    voxels = expand(vol, depth, height, width)
+
+    # 前景组件（6 邻接，全体数据范围）
+    face_nbrs = _NEIGHBORS[6]
+    comps = []
+    seen = set()
+    for start in sorted(voxels):
+        if start in seen:
+            continue
+        q = deque([start])
+        seen.add(start)
+        comp = set()
+        while q:
+            v = q.popleft()
+            comp.add(v)
+            z, y, x = v
+            for dz, dy, dx in face_nbrs:
+                w = (z + dz, y + dy, x + dx)
+                if w in voxels and w not in seen:
+                    seen.add(w)
+                    q.append(w)
+        comps.append(comp)
+    comps.sort(key=min)
+    voxel_to_cid = {}
+    for cid, comp in enumerate(comps, start=1):
+        for v in comp:
+            voxel_to_cid[v] = cid
+
+    z0, y0, x0, z1, y1, x1 = box
+    bg_nbrs = _NEIGHBORS[26]
+
+    def in_box(v):
+        z, y, x = v
+        return z0 <= z < z1 and y0 <= y < y1 and x0 <= x < x1
+
+    cavities = []
+    seen_bg = set()
+    for z in range(z0, z1):
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                seed = (z, y, x)
+                if seed in voxels or seed in seen_bg:
+                    continue
+                q = deque([seed])
+                seen_bg.add(seed)
+                region = set()
+                outside = False
+                touches = set()
+                while q:
+                    v = q.popleft()
+                    region.add(v)
+                    vz, vy, vx = v
+                    if (vz in (z0, z1 - 1) or vy in (y0, y1 - 1)
+                            or vx in (x0, x1 - 1)):
+                        outside = True
+                    for dz, dy, dx in bg_nbrs:
+                        w = (vz + dz, vy + dy, vx + dx)
+                        if not in_box(w) or w in voxels or w in seen_bg:
+                            continue
+                        seen_bg.add(w)
+                        q.append(w)
+                    for dz, dy, dx in face_nbrs:
+                        w = (vz + dz, vy + dy, vx + dx)
+                        if in_box(w) and w in voxel_to_cid:
+                            touches.add(voxel_to_cid[w])
+                if not outside:
+                    zs = [v[0] for v in region]
+                    ys = [v[1] for v in region]
+                    xs = [v[2] for v in region]
+                    cavities.append({
+                        "min": min(region),
+                        "voxels": len(region),
+                        "bbox": (min(zs), min(ys), min(xs),
+                                 max(zs) + 1, max(ys) + 1, max(xs) + 1),
+                        "touches": touches,
+                    })
+    cavities.sort(key=lambda c: c["min"])
+    return cavities
