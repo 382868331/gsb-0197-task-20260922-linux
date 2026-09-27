@@ -10,7 +10,7 @@
 不 sleep、不读取外部数据、不使用预录结果。
 """
 
-from rle_components import InvalidVolumeError, label
+from rle_components import InvalidVolumeError, StreamingLabeler, label
 
 DEPTH = HEIGHT = WIDTH = 4
 
@@ -103,6 +103,43 @@ def main():
         print(f"  如预期拒绝：{type(exc).__name__}: {exc}")
     else:  # pragma: no cover
         raise AssertionError("NaN 输入未被拒绝")
+
+    # --- 流式逐切片：尽早返回已确定不会再连接后续切片的组件 ---
+    print("\n=== 流式逐切片标记（connectivity=18）===")
+    lab = StreamingLabeler(HEIGHT, WIDTH, connectivity=18)
+    settled_all = []
+    for z, slice_rows in enumerate(vol):
+        settled = lab.append_slice(slice_rows)
+        settled_all.extend(settled)
+        print(
+            f"  追加 z={z}: 本次结算 {len(settled)} 个，"
+            f"仍在保留 {lab.pending_count} 个"
+        )
+        for c in settled:
+            print(
+                f"    已结算组件 id={c.id}: 体素={c.voxel_count} "
+                f"面积={c.exposed_area} 游程={list(c.runs)}"
+            )
+    tail = lab.finish()
+    settled_all.extend(tail)
+    print(f"  finish(): 结算剩余 {len(tail)} 个，待结算 {lab.pending_count} 个")
+    for c in tail:
+        print(
+            f"    尾部组件 id={c.id}: 体素={c.voxel_count} "
+            f"面积={c.exposed_area} 游程={list(c.runs)}"
+        )
+
+    # 真实验算：流式统计与离线 label 完全一致（按最小体素排序后）
+    ordered = sorted(
+        settled_all, key=lambda c: (c.min_z, c.min_y, c.min_x)
+    )
+    assert len(ordered) == len(results[18].components)
+    for sc, oc in zip(ordered, results[18].components):
+        assert sc.voxel_count == oc.voxel_count
+        assert sc.bbox == oc.bbox
+        assert sc.exposed_area == oc.exposed_area
+    assert lab.num_runs == results[18].num_runs
+    print("  验算通过：流式结算组件的体素/包围盒/面积与离线 label 一致。")
 
 
 if __name__ == "__main__":

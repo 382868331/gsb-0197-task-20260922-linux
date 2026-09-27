@@ -11,6 +11,7 @@ from .core import (
     Run,
     label,
 )
+from .streaming import StreamComponent, StreamingLabeler
 
 __all__ = [
     "BoundingBox",
@@ -18,5 +19,7 @@ __all__ = [
     "InvalidVolumeError",
     "LabelResult",
     "Run",
+    "StreamComponent",
+    "StreamingLabeler",
     "label",
 ]

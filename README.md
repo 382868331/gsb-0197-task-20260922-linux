@@ -34,6 +34,42 @@ from rle_components import label, Run, BoundingBox, Component, LabelResult
 result = label(runs, depth, height, width, connectivity=6)
 ```
 
+
+### 流式逐切片接口（增量追加，尽早结算）
+
+不想一次性给出全部切片时，用 `StreamingLabeler` 按 z 递增逐切片追加：
+
+```python
+from rle_components import StreamingLabeler
+
+lab = StreamingLabeler(height, width, connectivity=26)
+for rows in slices:          # rows: 单切片 [y] -> [(start, end), ...]
+    settled = lab.append_slice(rows)   # 立即返回已确定的组件（可能为空）
+    # ... 处理 settled：list[StreamComponent]
+rest = lab.finish()          # 明确结束输入，结算剩余组件
+```
+
+* **尽早返回**：处理完一张切片后，凡不含该切片游程的组件都不可能再与
+  后续切片相连（跨 z 邻接只可能触达当前切片），当次 `append_slice`
+  即返回它们；仍有机会连接下一片的组件继续保留，绝不提前结束。
+* **明确结束**：`finish()` 结算全部剩余组件；之后不能再追加或重复
+  `finish()`。空切片同样有效，并会切断跨 z 连接、触发前序组件结算。
+* **统计一致**：每个 `StreamComponent` 的 `voxel_count`、`bbox`、
+  `exposed_area`、`(min_z,min_y,min_x)` 与离线 `label` 的对应组件
+  完全相同；`runs` 给出该组件全部游程的 `(z, y, run_index)` 定位，
+  逐游程对应离线 `run_labels`。
+* **ID 口径**：流式 `id` 按**结算顺序** 1 起始连续分配（同一批次内
+  按最小体素排序），一般不等于离线 ID；把流式输出的全部组件按
+  `(min_z, min_y, min_x)` 排序后，即逐一对应 `label` 的 ID。
+* **切片释放**：任何时刻只保留当前与前一切片的游程；组件结算后其
+  并查集聚合状态立即释放，`finish()` 后不再持有任何切片数据。
+* **状态查询**：`num_slices` / `num_runs` / `pending_count` /
+  `finished`。
+* **错误语义**：单切片非法时（与 `label` 相同的定位错误）抛
+  `InvalidVolumeError` 且**不改动内部状态**，修正后可继续追加；
+  切片数上限 512、游程总数上限 20000 与一次性接口相同。
+
+
 * `runs`：`[z][y] -> [(start, end), ...]`。固定 (z, y) 的一行内，游程为
   沿 x 轴的**半开区间 `[start, end)`**；每行游程必须按 `start` 升序、
   互不重叠（端点恰好相接合法，重叠非法）。游程元素可为
@@ -107,6 +143,11 @@ result = label(runs, depth, height, width, connectivity=6)
    边/角接触不共享体素面，故不影响面积（三种连通性下面积定义一致）。
 5. **排序键与包围盒分离聚合**。节点按 (z,y,行内序) 创建，DSU 根第一次
    被遇到的位置即组件字典序最小体素；几何包围盒独立取各轴 min/max。
+6. **流式增量接口**。`StreamingLabeler` 复用同一套校验、触达与面积计数
+   逻辑；合并在并查集根上即时聚合体素数、包围盒、内部面数与游程定位，
+   因此结算时无需回溯历史节点。每张切片处理完，凡根上不含当前切片游程
+   （最大游程 z 小于当前 z）的组件不可能再与后续切片相连，立即结算并
+   删除其聚合状态；只保留当前与前一切片的游程数据。
 
 ## 数值口径 / 误差
 
@@ -135,5 +176,7 @@ BFS 求组件、逐体素逐方向数暴露面；它不导入、不调用 `rle_c
 * 只实现本题规定的 6/18/26 三维栅格连通性与按行 x 游程输入，不宣称兼容
   ITK/VTK/`ndimage` 等行业库的全部标签选项、像素类型或流式协议。
 * 不做体素展开后的形态学操作、不输出体素级标签体（设计上避免展开）。
-* 输入须一次性给出全部切片；不支持增量追加切片的有状态 API。
+* 一次性 `label` 仍要求一次性给出全部切片；增量场景请使用
+  流式接口 `StreamingLabeler`（统计口径与 `label` 完全一致，
+  组件 ID 按结算顺序分配，语义见上文）。
 * 尺寸与游程数上限为题面给定的 512 / 20000；超过即拒绝而非自动外存化。
