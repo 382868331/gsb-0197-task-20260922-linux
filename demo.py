@@ -10,7 +10,7 @@
 不 sleep、不读取外部数据、不使用预录结果。
 """
 
-from rle_components import InvalidVolumeError, label
+from rle_components import InvalidVolumeError, StreamingLabeler, label
 
 DEPTH = HEIGHT = WIDTH = 4
 
@@ -103,6 +103,29 @@ def main():
         print(f"  如预期拒绝：{type(exc).__name__}: {exc}")
     else:  # pragma: no cover
         raise AssertionError("NaN 输入未被拒绝")
+
+    # --- 流式接口：逐切片追加，尽早结算已封闭组件 ---
+    print("\n=== 流式逐切片追加（connectivity=26）===")
+    streamer = StreamingLabeler(HEIGHT, WIDTH, connectivity=26)
+    streamed = []
+    for z, rows in enumerate(vol):
+        done = streamer.append_slice(rows)
+        streamed.extend(done)
+        for c in done:
+            print(f"  追加切片 z={z} 后结算组件 {c.id}: "
+                  f"体素={c.voxel_count} 暴露面积={c.exposed_area}")
+    rest = streamer.finish()
+    streamed.extend(rest)
+    for c in rest:
+        print(f"  finish() 结算组件 {c.id}: "
+              f"体素={c.voxel_count} 暴露面积={c.exposed_area}")
+    # 与离线结果逐项一致（ID、体素数、包围盒、暴露面积、最小体素）
+    offline = results[26].components
+    assert len(streamed) == len(offline)
+    for got, want in zip(streamed, offline):
+        assert got == want, (got, want)
+    print(f"  验算通过：流式 {len(streamed)} 个组件与离线 label() 完全一致，"
+          f"共 {streamer.num_runs} 条游程。")
 
 
 if __name__ == "__main__":

@@ -152,6 +152,85 @@ def _check_coord(value: object, where: str) -> int:
     return value
 
 
+def _check_connectivity(value: object) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in _VALID_CONNECTIVITY
+    ):
+        raise InvalidVolumeError(
+            f"connectivity 必须为整数 6/18/26 之一（拒绝 bool/float），"
+            f"得到 {type(value).__name__}: {value!r}"
+        )
+    return value
+
+
+def _normalize_slice(
+    slice_rows: object, z: int, height: int, width: int, total: int
+) -> tuple[list[list[tuple[int, int]]], int]:
+    """校验并规范化单个切片；返回 (规范切片, 累计游程数)。"""
+
+    if not isinstance(slice_rows, Sequence) or isinstance(
+        slice_rows, (str, bytes)
+    ):
+        raise InvalidVolumeError(
+            f"z={z}: 切片必须为按行组织的序列，"
+            f"得到 {type(slice_rows).__name__}"
+        )
+    if len(slice_rows) != height:
+        raise InvalidVolumeError(
+            f"z={z}: 行数 {len(slice_rows)} 与 height={height} 不一致"
+        )
+
+    out_slice: list[list[tuple[int, int]]] = []
+    for y, row in enumerate(slice_rows):
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
+            raise InvalidVolumeError(
+                f"z={z} y={y}: 行必须为游程序列，得到 {type(row).__name__}"
+            )
+
+        out_row: list[tuple[int, int]] = []
+        prev_end = 0
+        for ri, run in enumerate(row):
+            where = f"z={z} y={y} run={ri}"
+            if isinstance(run, dict):
+                if set(run) != {"start", "end"}:
+                    raise InvalidVolumeError(
+                        f"{where}: 字典游程只能含键 start/end，得到 {sorted(run)}"
+                    )
+                raw0, raw1 = run["start"], run["end"]
+            elif isinstance(run, Sequence) and not isinstance(
+                run, (str, bytes)
+            ) and len(run) == 2:
+                raw0, raw1 = run[0], run[1]
+            else:
+                raise InvalidVolumeError(
+                    f"{where}: 游程必须为 (start, end) 二元组，得到 {run!r}"
+                )
+
+            x0 = _check_coord(raw0, where + ".start")
+            x1 = _check_coord(raw1, where + ".end")
+            if not 0 <= x0 < x1 <= width:
+                raise InvalidVolumeError(
+                    f"{where}: 要求 0 <= start < end <= width({width})，"
+                    f"得到 start={x0}, end={x1}（空游程/越界均非法）"
+                )
+            if ri > 0 and x0 < prev_end:
+                raise InvalidVolumeError(
+                    f"{where}: 游程必须按 start 升序且互不重叠，"
+                    f"start={x0} 早于上游 end={prev_end}"
+                )
+            out_row.append((x0, x1))
+            prev_end = x1
+            total += 1
+            if total > MAX_RUNS:
+                raise InvalidVolumeError(
+                    f"游程总数超过上限 {MAX_RUNS}（z={z} y={y} run={ri}）"
+                )
+        out_slice.append(out_row)
+    return out_slice, total
+
+
 def _normalize_runs(
     runs: object, depth: int, height: int, width: int
 ) -> list[list[list[tuple[int, int]]]]:
@@ -166,68 +245,9 @@ def _normalize_runs(
 
     normalized: list[list[list[tuple[int, int]]]] = []
     total = 0
-
     for z, slice_rows in enumerate(runs):
-        if not isinstance(slice_rows, Sequence) or isinstance(
-            slice_rows, (str, bytes)
-        ):
-            raise InvalidVolumeError(
-                f"z={z}: 切片必须为按行组织的序列，"
-                f"得到 {type(slice_rows).__name__}"
-            )
-        if len(slice_rows) != height:
-            raise InvalidVolumeError(
-                f"z={z}: 行数 {len(slice_rows)} 与 height={height} 不一致"
-            )
-
-        out_slice: list[list[tuple[int, int]]] = []
-        for y, row in enumerate(slice_rows):
-            if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
-                raise InvalidVolumeError(
-                    f"z={z} y={y}: 行必须为游程序列，得到 {type(row).__name__}"
-                )
-
-            out_row: list[tuple[int, int]] = []
-            prev_end = 0
-            for ri, run in enumerate(row):
-                where = f"z={z} y={y} run={ri}"
-                if isinstance(run, dict):
-                    if set(run) != {"start", "end"}:
-                        raise InvalidVolumeError(
-                            f"{where}: 字典游程只能含键 start/end，得到 {sorted(run)}"
-                        )
-                    raw0, raw1 = run["start"], run["end"]
-                elif isinstance(run, Sequence) and not isinstance(
-                    run, (str, bytes)
-                ) and len(run) == 2:
-                    raw0, raw1 = run[0], run[1]
-                else:
-                    raise InvalidVolumeError(
-                        f"{where}: 游程必须为 (start, end) 二元组，得到 {run!r}"
-                    )
-
-                x0 = _check_coord(raw0, where + ".start")
-                x1 = _check_coord(raw1, where + ".end")
-                if not 0 <= x0 < x1 <= width:
-                    raise InvalidVolumeError(
-                        f"{where}: 要求 0 <= start < end <= width({width})，"
-                        f"得到 start={x0}, end={x1}（空游程/越界均非法）"
-                    )
-                if ri > 0 and x0 < prev_end:
-                    raise InvalidVolumeError(
-                        f"{where}: 游程必须按 start 升序且互不重叠，"
-                        f"start={x0} 早于上游 end={prev_end}"
-                    )
-                out_row.append((x0, x1))
-                prev_end = x1
-                total += 1
-                if total > MAX_RUNS:
-                    raise InvalidVolumeError(
-                        f"游程总数超过上限 {MAX_RUNS}（z={z} y={y} run={ri}）"
-                    )
-            out_slice.append(out_row)
+        out_slice, total = _normalize_slice(slice_rows, z, height, width, total)
         normalized.append(out_slice)
-
     return normalized
 
 
@@ -325,15 +345,7 @@ def label(
     depth = _check_dim(depth, "depth")
     height = _check_dim(height, "height")
     width = _check_dim(width, "width")
-    if (
-        isinstance(connectivity, bool)
-        or not isinstance(connectivity, int)
-        or connectivity not in _VALID_CONNECTIVITY
-    ):
-        raise InvalidVolumeError(
-            f"connectivity 必须为整数 6/18/26 之一（拒绝 bool/float），"
-            f"得到 {type(connectivity).__name__}: {connectivity!r}"
-        )
+    connectivity = _check_connectivity(connectivity)
 
     vol = _normalize_runs(runs, depth, height, width)
     edge_mode = connectivity >= 18   # 18 或 26 合并边接触

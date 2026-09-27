@@ -62,6 +62,38 @@ result = label(runs, depth, height, width, connectivity=6)
 必然等于几何包围盒的 `(min_z,min_y,min_x)`：在 18/26 邻接下，几何上
 `y`/`x` 更小的体素可能只出现在更大的 `z` 切片（测试中明确覆盖此区别）。
 
+## 流式接口（逐切片追加）
+
+除一次性 `label` 外，模块提供有状态的 `StreamingLabeler`，允许按 z
+顺序逐切片追加输入，并**尽早返回已确定不会再与后续切片相连的组件**：
+
+```python
+from rle_components import StreamingLabeler
+
+streamer = StreamingLabeler(height, width, connectivity=6)
+for rows in slices:                      # rows: 单个切片 [y] -> [(start, end), ...]
+    done = streamer.append_slice(rows)   # 本次确定封闭的 Component 列表（可为空）
+rest = streamer.finish()                 # 输入结束，结算剩余全部组件
+```
+
+* `append_slice(rows)`：校验并合并一个切片，返回本次可以确定封闭的
+  `Component` 列表（按组件 ID 升序；没有可结算组件时为空列表）。
+  连接只发生在相邻切片之间，因此处理完切片 z 后，最后出现于 z-1 或更早
+  的组件已不可能再生长，立即结算；**仍触及最新切片的组件继续保留，
+  绝不提前结束**。
+* `finish()`：声明输入结束，结算并返回剩余全部组件。之后再次
+  `append_slice` 或 `finish` 抛 `RuntimeError`。
+* 把各次返回值按顺序拼接，得到的组件序列与离线 `label(全部切片, ...)`
+  **逐项一致**（ID、体素数、包围盒、暴露面积、最小体素坐标）。组件 ID
+  仍按最小 (z,y,x) 字典序分配：已封闭但排序键大于某个活跃组件的组件会
+  暂存，直到顺序安全才发出。
+* 内存：任何时刻只保留**前一切片**的游程与活跃组件的聚合状态；已结算
+  组件与更早切片的历史立即释放。
+* 校验与离线完全一致（同一套 `InvalidVolumeError` 与定位前缀）；单切片
+  校验失败时对象状态不变，可继续追加。切片数上限 512、累计游程数上限
+  20000 与离线相同。只读属性：`num_slices` / `num_runs` /
+  `finalized_count` / `connectivity`。
+
 ## 输入上限（接口边界）
 
 * `depth`、`height`、`width` 各 `<= 512`；
@@ -135,5 +167,6 @@ BFS 求组件、逐体素逐方向数暴露面；它不导入、不调用 `rle_c
 * 只实现本题规定的 6/18/26 三维栅格连通性与按行 x 游程输入，不宣称兼容
   ITK/VTK/`ndimage` 等行业库的全部标签选项、像素类型或流式协议。
 * 不做体素展开后的形态学操作、不输出体素级标签体（设计上避免展开）。
-* 输入须一次性给出全部切片；不支持增量追加切片的有状态 API。
+* 离线 `label` 仍须一次性给出全部切片；增量需求由有状态的
+  `StreamingLabeler` 承担（见“流式接口”一节），二者组件结果一致。
 * 尺寸与游程数上限为题面给定的 512 / 20000；超过即拒绝而非自动外存化。
